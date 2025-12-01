@@ -1,8 +1,13 @@
-use crate::{address::PhysAddr, greq::services::{get_regular_report, REPORT_RESPONSE_SIZE} };
-use crate::greq::pld_report::{SnpReportResponse, AttestationReport};
-use crate::protocols::errors::SvsmReqError;
-use crate::protocols::RequestParams;
-use crate::mm::PerCPUPageMappingGuard;
+use crate::address::PhysAddr;
+pub const REPORT_RESPONSE_SIZE: usize = size_of::<SnpReportResponse>();
+use crate::interop::report::{SnpReportResponse, AttestationReport};
+//use crate::greq::pld_report::{SnpReportResponse, AttestationReport};
+//use crate::protocols::errors::SvsmReqError;
+//use crate::protocols::RequestParams;
+use crate::RequestParams;
+use crate::SvsmReqError;
+//use crate::mm::PerCPUPageMappingGuard;
+use crate::memory::paging::PerCPUPageMappingGuard;
 use core::slice;
 extern crate alloc;
 use alloc::vec::Vec;
@@ -18,15 +23,17 @@ use crate::my_crypto_wrapper::key_pair;
 use crate::process_manager::PROCESS_STORE;
 use crate::process_manager::process::ProcessID;
 use crate::process_manager::process_paging::ProcessPageTableRef;
-use crate::mm::PAGE_SIZE;
+//use crate::mm::PAGE_SIZE;
+pub const PAGE_SIZE: usize = 4096;
 
 /* crates for attestation microbenchmarks */
 use crate::process_manager::process_paging::{TP_MANIFEST_START_VADDR, TP_LIBOS_START_VADDR, TP_FUNCTION_START_VADDR};
 use crate::process_manager::process_memory::ALLOCATION_RANGE_VIRT_START;
-use crate::cpu::control_regs::{read_cr3};
+use crate::interop::memory::read_cr3;
+//use crate::cpu::control_regs::{read_cr3};
 use crate::address::Address;
 use crate::process_manager::process_memory::{PGD, addr_to_idx};
-use crate::cpu::flush_tlb_global;
+use crate::interop::memory::flush_tlb_global;
 /* end of crates for attestation microbenchmarks */
 
 struct StoredSNPReport {
@@ -171,7 +178,7 @@ fn monitor_report(params: &mut RequestParams) -> Result<(), SvsmReqError> {
         let mut rep: [u8; REPORT_RESPONSE_SIZE] = [0; REPORT_RESPONSE_SIZE];
 
         /* Get a regular report of type struct SnpReportResponse */
-        let _rep_struct_size = match get_regular_report(&mut rep) {
+        let _rep_struct_size = match crate::interop::report::get_regular_report(&mut rep) {//get_regular_report(&mut rep) {
             Ok(e) => e,
             Err(e) => {
                 log::info!("Error from get report: {:?}", e);
@@ -504,7 +511,7 @@ fn monitor_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     let mut rep: [u8; REPORT_RESPONSE_SIZE] = [0; REPORT_RESPONSE_SIZE];
 
     /* Get a regular report of type struct SnpReportResponse */
-    let _rep_struct_size = match get_regular_report(&mut rep) {
+    let _rep_struct_size = match crate::interop::report::get_regular_report(&mut rep) {
         Ok(e) => e,
         Err(e) => {
             log::info!("Error from get report: {:?}", e);

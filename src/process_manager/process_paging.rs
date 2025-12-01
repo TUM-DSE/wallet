@@ -1,10 +1,13 @@
-use crate::{address::{Address, PhysAddr, VirtAddr}, cpu::flush_tlb_global, paddr_as_table, process_manager::process_memory::allocate_page, sev::{rmp_adjust, RMPFlags}};
+use crate::{address::{Address, PhysAddr, VirtAddr}, paddr_as_table, process_manager::process_memory::allocate_page, sev::{rmp_adjust, RMPFlags}};
+use crate::interop::memory::flush_tlb_global;
 use crate::{paddr_as_slice, paddr_as_u64_slice, vaddr_as_u64_slice, vaddr_as_slice, map_paddr, strip_paddr};
 use crate::process_manager::memory_helper::{strip_c_bit, set_c_bit_in_address};
-use crate::mm::PerCPUPageMappingGuard;
-use bitflags::{bitflags};
+//use crate::mm::PerCPUPageMappingGuard;
+use crate::memory::paging::PerCPUPageMappingGuard;
+use bitflags::bitflags;
 use elf::{Elf64Phdr, Elf64PhdrFlags};
-use crate::mm::PAGE_SIZE;
+//use crate::mm::PAGE_SIZE;
+pub const PAGE_SIZE: usize = 4096;
 use igvm_defs::PAGE_SIZE_4K;
 use core::ops::{Index, IndexMut};
 use core::slice;
@@ -598,13 +601,18 @@ impl ProcessPageTableRef {
         }
     }
 
-
+    #[inline(always)]
     pub fn add_stack(&self, start: VirtAddr, size: u64){
+        log::debug!("Does it get here?");
         for i in 0..(size as usize) {
+            log::debug!("Stack Page {}", i);
             let new_page = allocate_page();
             let (mapping, s) = paddr_as_slice!(new_page);
+            log::debug!("Write Stack");
             _ = replace(s, ZERO_PAGE);
+            log::debug!("Add Stack");
             self.map_4k_page(start + i * PAGE_SIZE, new_page, ProcessPageFlags::data());
+            log::debug!("adjust stack");
             rmp_adjust(mapping.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX , PageSize::Regular).unwrap();
         }
     }
@@ -631,6 +639,18 @@ impl ProcessPageTableRef {
             let (_mapping,origin_slice) = paddr_as_slice!(origin_phys);
             let target_vaddr = target + 4096usize * (i as usize);
             let target_slice = vaddr_as_slice!(target_vaddr);
+
+
+            //log::debug!("Origin: {:x?}/{:x?}, target: {:x?}/{:x?}",
+            //origin_phys, _mapping.virt_addr(), target_vaddr, super::process_memory::ProcessMemConfig::virt_to_phys(target_vaddr));
+            let cr3 = crate::interop::memory::read_cr3();
+            let (_m1, pt) = paddr_as_u64_slice!(cr3);
+            let (_m2, pt2) = paddr_as_u64_slice!(strip_paddr!(pt[6].into()));
+            let (_m3, pt3) = paddr_as_u64_slice!(strip_paddr!(pt2[0].into()));
+            let (_m4, pt4) = paddr_as_u64_slice!(strip_paddr!(pt3[0].into()));
+
+            //let a = origin_slice[0];
+
             // Copying the src to dst
             _ = replace(target_slice, *origin_slice);
         }
@@ -665,6 +685,7 @@ impl ProcessPageTableRef {
         //let mut prev_addr = table_entry.0;
 
         if !table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+            log::debug!("Not present");
             return PhysAddr::null();
         }
 
@@ -676,6 +697,7 @@ impl ProcessPageTableRef {
             index = ProcessPageTable::index_arg(i, addr);
             table_entry = table[index];
             if !table_entry.flags().contains(ProcessPageFlags::PRESENT){
+                log::debug!("Not present {}",i);
                 return PhysAddr::null();
             }
         }
@@ -798,19 +820,16 @@ impl ProcessPageTableRef {
     /// specified starteding from addr and edning at addr + size * pagesize
     /// into a AllocationRange in the Monitor
     pub fn copy_data_from_guest(addr: u64, size: u64, page_table: u64) -> (VirtAddr, AllocationRange){
-
         let copy_size = size + (PAGE_SIZE_4K - size % PAGE_SIZE_4K); //Extend size ot full page size
         let copy_page_count = copy_size / PAGE_SIZE_4K;
         let mut alloc_range = AllocationRange(0,0);
+        // panic is triggered
         alloc_range.allocate(copy_page_count);
+        // Assert is triggered
         let target = VirtAddr::from(ALLOCATION_RANGE_VIRT_START);
-
         let mut page_table_ref = ProcessPageTableRef::default();
-
         page_table_ref.set_external_table(page_table);
-
         page_table_ref.copy_address_range(VirtAddr::from(addr), copy_size, target);
-
         (target, alloc_range)
     }
 
@@ -902,6 +921,7 @@ impl ProcessPageTableRef {
                           ProcessPageFlags::USER_ACCESSIBLE | ProcessPageFlags::ACCESSED;
 
         let mut finished = false;
+
 
         while !finished {
             match current_mapping {

@@ -2,7 +2,8 @@
 
 use crate::{address::{Address, PhysAddr}, utils::immut_after_init::ImmutAfterInitCell};
 use core::cmp;
-use crate::cpu::cpuid::cpuid_table;
+//use crate::cpu::cpuid::cpuid_table;
+use crate::interop::cpuid::cpuid_table;
 
 pub const ZERO_PAGE: [u64;512] = [0;512];
 pub const ZERO_PAGE_REF_U8: &[u8; 4096] = unsafe { &*(&ZERO_PAGE as *const [u64;512] as *const [u8;4096]) };

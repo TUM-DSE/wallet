@@ -1,16 +1,18 @@
-use crate::cpu::flush_tlb_global;
+use crate::interop::memory::flush_tlb_global;
 use crate::process_manager::process_memory::{allocate_page, free_page};
-use crate::mm::PAGE_SIZE;
+//use crate::mm::PAGE_SIZE;
+pub const PAGE_SIZE: usize = 4096;
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::process_manager::process_paging::{ProcessPageTableEntry, ProcessPageTablePage, ProcessPageTableRef};
 use crate::process_manager::process_paging::ProcessPageFlags;
 use super::process_memory::PGD;
-use crate::cpu::control_regs::read_cr3;
+use crate::interop::memory::read_cr3;
 use crate::sev::{rmp_adjust, RMPFlags};
 use crate::types::PageSize;
 use crate::{paddr_as_slice, map_paddr, vaddr_as_slice, paddr_as_table, strip_paddr};
 use crate::process_manager::memory_helper::strip_c_bit;
-use crate::mm::PerCPUPageMappingGuard;
+//use crate::mm::PerCPUPageMappingGuard;
+use crate::memory::paging::PerCPUPageMappingGuard;
 
 const ALLOCATION_VADDR_START: u64 = 0x30000000000u64;
 pub const DEFAULT_ALLOCATION_RANGE_MOUNT: usize = 6;
@@ -28,6 +30,7 @@ impl AllocationRange {
         let mut page_table_ref = ProcessPageTableRef::default();
         page_table_ref.set_external_table(read_cr3().bits() as u64);
         self.allocate_(&mut page_table_ref, pages, ALLOCATION_VADDR_START, true, false);
+        //page_table_ref.print_table();
     }
 
     pub fn allocate_with_start_addr(&mut self, page_table_ref: &mut ProcessPageTableRef, pages: u64, start_addr: u64){
@@ -47,7 +50,9 @@ impl AllocationRange {
 
         let start_address = VirtAddr::from(start_addr);
 
+
         for i in 0..(pages as usize) {
+            log::debug!("allocate_: {}", i);
             let current_page = allocate_page();
             if !mount {
                 let (mapping, _page_mapped) = paddr_as_slice!(current_page);
@@ -55,6 +60,8 @@ impl AllocationRange {
             }
             page_table_ref.map_4k_page(start_address + i * PAGE_SIZE, current_page, table_flags);
         };
+
+
         if mount {
             let (_mapping, pgd) = paddr_as_slice!(read_cr3());
             self.0 = pgd[DEFAULT_ALLOCATION_RANGE_MOUNT];
@@ -95,7 +102,6 @@ impl AllocationRange {
         let (_mapping, pgd) = paddr_as_slice!(read_cr3());
         pgd[DEFAULT_ALLOCATION_RANGE_MOUNT] = 0;
         flush_tlb_global();
-
     }
 
     pub fn mount_at(&self, loc: usize) -> u64 {
@@ -132,7 +138,7 @@ impl AllocationRange {
                     if !pte_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
                         break
                     }
-
+                    log::debug!("Freeing: {:x?}", strip_paddr!(pte_table_entry.0));
                     free_page(strip_paddr!(pte_table_entry.0));
                 }
                 free_page(strip_paddr!(pmd_table_entry.0));

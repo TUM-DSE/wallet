@@ -1,27 +1,43 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::address::{PhysAddr, VirtAddr};
-use crate::cpu::control_regs::read_cr3;
-use crate::cpu::msr::rdtsc;
+//use crate::cpu::control_regs::read_cr3;
+use crate::interop::memory::read_cr3;
+//use crate::cpu::msr::rdtsc;
+use crate::interop::memory::rdtsc;
 use crate::locking::SpinLock;
-use crate::mm::pagetable::{get_init_pgtable_locked, PTEntry, PTEntryFlags, PageTable};
+//use crate::mm::pagetable::{get_init_pgtable_locked, PTEntry, PTEntryFlags, PageTable};
 use crate::process_manager::outb::outb;
-use crate::protocols::errors::SvsmReqError;
+//use crate::protocols::errors::SvsmReqError;
+use crate::SvsmReqError;
 use crate::sev::SevSnpError;
 use crate::types::PageSize;
 use crate::sev::PvalidateOp;
 use crate::sev::pvalidate;
-use crate::protocols::core::PVALIDATE_LOCK;
-use crate::error::SvsmError;
-use crate::mm::PAGE_SIZE;
-use crate::cpu::ghcb::current_ghcb;
-use crate::sev::ghcb::PageStateChangeOp;
-use crate::mm::PerCPUPageMappingGuard;
+//use crate::protocols::core::PVALIDATE_LOCK;
+use crate::locking::get_pvalidate_lock;
+use crate::sev::utils::SvsmError;
+//use crate::mm::PAGE_SIZE;
+pub const PAGE_SIZE: usize = 4096;
+//use crate::cpu::ghcb::current_ghcb;
+//use crate::cpu::current_ghcb;
+//use crate::sev::ghcb::PageStateChangeOp;
+#[derive(Debug, Clone, Copy)]
+pub enum PageStateChangeOp {
+    PscPrivate,
+    PscShared,
+    PscPsmash,
+    PscUnsmash,
+}
+//use crate::mm::PerCPUPageMappingGuard;
+use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::utils::immut_after_init::ImmutAfterInitCell;
 use crate::utils::MemoryRegion;
-use crate::mm::phys_to_virt;
+//use crate::mm::phys_to_virt;
+use crate::memory::paging::phys_to_virt;
 use crate::{paddr_as_u64_slice, map_paddr, vaddr_as_u64_slice};
-use crate::mm::memory::get_memory_region_from_map;
+//use crate::mm::memory::get_memory_region_from_map;
+use crate::memory::regions::get_memory_region_from_map;
 use crate::address::Address;
 use crate::sev::{rmp_adjust, RMPFlags};
 use core::ptr::replace;
@@ -162,12 +178,20 @@ impl ProcessMemConfig{
 
         //Map the memory region for the Page list into the current core's page table
         let region = get_memory_region_from_map(1);
-        let mut pgtable = get_init_pgtable_locked(); //Gets the shared page table for all cores (Does not affect cores)
-        pgtable.map_region_4k(free_memory_list_memory_range, region.start() + ADDITIONAL_GUEST_MEMORY, PTEntryFlags::data()).unwrap();
-        let page_table_entry = PTEntry::from(read_cr3()); // Get current core's page table
-        let address = phys_to_virt(page_table_entry.address());
-        let page_table_page = unsafe { &mut *address.as_mut_ptr::<PageTable>() };
-        page_table_page.get_root()[1] = pgtable.get_root()[1]; // Copy page table for free memory list to active page table
+        //let mut pgtable = get_init_pgtable_locked(); //Gets the shared page table for all cores (Does not affect cores)
+        //pgtable.map_region_4k(free_memory_list_memory_range, region.start() + ADDITIONAL_GUEST_MEMORY, PTEntryFlags::data()).unwrap();
+        //let page_table_entry = PTEntry::from(read_cr3()); // Get current core's page table
+        //let address = phys_to_virt(page_table_entry.address());
+        //let page_table_page = unsafe { &mut *address.as_mut_ptr::<PageTable>() };
+        //page_table_page.get_root()[1] = pgtable.get_root()[1]; // Copy page table for free memory list to active page table
+        use crate::paddr_as_table;
+        use crate::process_manager::process_paging::ProcessPageTablePage;
+        use crate::process_manager::process_paging::ProcessPageTableEntry;
+        let (mapping, pg) = paddr_as_table!(read_cr3());
+        log::debug!("{:x?}",pg[1]);
+
+        let pt_1 = crate::interop::memory::map_svsm_page_table(free_memory_list_memory_range, region.start() + ADDITIONAL_GUEST_MEMORY);
+        pg[1] = ProcessPageTableEntry(pt_1.into());
         for p in 0..(free_memory_list_size / PAGE_SIZE) { //Iterate over every require page
             let offset = p * PAGE_SIZE;
             let vaddr = VirtAddr::from(ADDRESS_START_FREE_PAGE_LIST);
@@ -182,24 +206,36 @@ impl ProcessMemConfig{
                 e[i] = 0;
             }
         }
-        let (_m, pt) = paddr_as_u64_slice!(read_cr3());
-        pt[1]
+        //let (_m, pt) = paddr_as_u64_slice!(read_cr3());
+        //pt[1]
+        pt_1
     }
 
     fn validate_and_clear(addr: u64){
         let mapping = PerCPUPageMappingGuard::create_4k(PhysAddr::from(addr)).unwrap();
         let virt = mapping.virt_addr();
         let entry: &mut [u64;512] = unsafe { &mut *virt.as_mut_ptr::<[u64;512]>() };
+        log::debug!("Validating page: {:x?}", PhysAddr::from(addr));
         monitor_pvalidate_vaddr_4k(virt, PhysAddr::from(addr)).unwrap();
 
+        log::debug!("Clearing page: {:x?}", virt);
+        use crate::strip_paddr;
+        use crate::process_manager::memory_helper::strip_c_bit;
+        let a:usize = ((u64::from(virt) >> 12) & 0xFF).try_into().unwrap();
+        let (_m1, pgd) = paddr_as_u64_slice!(read_cr3());
+        let (_m2, pud) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pgd[510])));
+        let (_m3, pmd) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pud[1])));
+        let (_m4, pte) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pmd[0])));
+        log::debug!("PhysAddr({}): {:x?}",a, pte[a] );
         for i in 0..512 {
             entry[i] = 0;
         }
     }
 
     fn get_current_pagetable_as_u64_slice() -> &'static mut [u64;512] {
-        let page_table_entry = PTEntry::from(read_cr3());
-        let address = phys_to_virt(page_table_entry.address());
+        //let page_table_entry = PTEntry::from(read_cr3());
+        //let address = phys_to_virt(page_table_entry.address());
+        let address = phys_to_virt(read_cr3());
         vaddr_as_u64_slice!(address)
     }
 
@@ -287,17 +323,34 @@ impl ProcessMemConfig{
 
 
     fn check_for_free_page(&mut self) -> PhysAddr {
+        //log::debug!("self.free_page_list_used_len: {}", self.free_page_list_used_len);
         if self.free_page_list_used_len == 0 {
             return PhysAddr::null();
         }
         self.free_page_list_used_len -= 1;
         let addr = self.free_page_list + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH);
         let entry: &mut PhysAddr = unsafe {&mut *((addr) as *mut PhysAddr)};
+
+        log::debug!("New address: {:x?}", entry);
         let tmp = *entry;
         *entry = PhysAddr::null();
-
-        let (_mapping, a) = paddr_as_u64_slice!(tmp);
+        log::debug!("rmp adjust");
+        let (mapping, a) = paddr_as_u64_slice!(tmp);
+        rmp_adjust(mapping.virt_addr(), RMPFlags::VMPL0 | RMPFlags::RWX , PageSize::Regular);
+        use crate::process_manager::memory_helper::strip_c_bit;
+        use crate::strip_paddr;
+        let b:usize = ((u64::from(mapping.virt_addr()) >> 12) & 0xFF).try_into().unwrap();
+        let (_m1, pgd) = paddr_as_u64_slice!(read_cr3());
+        let (_m2, pud) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pgd[510])));
+        let (_m3, pmd) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pud[1])));
+        let (_m4, pte) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pmd[0])));
+        //let (_m5, result) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pte[4])));
+        log::debug!("Result({}): {:x?}", b, pte[b]);
+        log::debug!("Test write: {:x?}, {:x?}", mapping.virt_addr(), tmp);
+        a[0] = 0;
+        log::debug!("zeroing");
         a.fill(0);
+        log::debug!("Returning");
         tmp
     }
 
@@ -348,11 +401,12 @@ impl ProcessMemConfig{
                 unsafe { assert_ne!(*(addr as *mut PhysAddr), free); }
             }
 
+            // This check does does not make sense free.bits should never be in this range
             if free.bits() < 0x100c00000 || free.bits() > 0x10e000000 {
                 log::info!("freeing wrong page? {:#x}", free);
             }
         }
-
+        //log::debug!("Page List: {:x?}, offset: {:x?}({:?})", self.free_page_list, self.free_page_list_used_len as u64 * ADDRESS_LENGTH, self.free_page_list_used_len);
         let addr = self.free_page_list + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH);
         let entry = addr as *mut PhysAddr;
         unsafe {
@@ -366,7 +420,7 @@ impl ProcessMemConfig{
         self.page_base.bits() - self.free_page_list_used_len * PAGE_SIZE
     }
 
-    pub fn virt_to_phys(&self, vaddr: VirtAddr) -> PhysAddr {
+    pub fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
         let pgd_table = ProcessMemConfig::get_current_pagetable_as_u64_slice();
         let mut addr = pgd_table[addr_to_idx(usize::from(vaddr), PGD)];
         let (_pud_mapping, pud_table) = paddr_as_u64_slice!(PhysAddr::from(addr & 0xFFFFFFFFFFFFE000));
@@ -421,12 +475,15 @@ pub fn add_monitor_memory() -> Result<(), SvsmError>{
 }
 
 fn monitor_pvalidate_vaddr_4k(vaddr: VirtAddr, paddr: PhysAddr) -> Result<(), SvsmReqError>{
-   monitor_pvalidate_vaddr(vaddr, paddr,PAGE_SIZE, PageSize::Regular, PvalidateOp::Valid, false)
+    log::debug!("pvalidating: {:x?}", paddr);
+    monitor_pvalidate_vaddr(vaddr, paddr,PAGE_SIZE, PageSize::Regular, PvalidateOp::Valid, false)
 }
-
+use crate::process_manager::process_paging::ProcessPageTableRef;
 fn monitor_pvalidate_vaddr(vaddr: VirtAddr, paddr: PhysAddr, ps_s: usize, ps: PageSize, _pvop: PvalidateOp, ign_cf: bool) -> Result<(), SvsmReqError> {
-    current_ghcb().page_state_change(paddr, paddr + ps_s, ps, PageStateChangeOp::PscPrivate).unwrap();
-    let lock = PVALIDATE_LOCK.lock_read();
+    //current_ghcb().page_state_change(paddr, paddr + ps_s, ps, PageStateChangeOp::PscPrivate).unwrap();
+    let pg: ProcessPageTableRef = ProcessPageTableRef{process_page_table: read_cr3()};
+    crate::interop::snp::page_state_change(paddr, paddr + ps_s, ps, PageStateChangeOp::PscPrivate);
+    let lock = get_pvalidate_lock().lock_read();
     pvalidate(vaddr,PageSize::Regular, PvalidateOp::Valid).or_else(
         |err| match err{
             SvsmError::SevSnp(SevSnpError::FAIL_UNCHANGED(_)) if ign_cf => Ok(()),

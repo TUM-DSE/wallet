@@ -1,4 +1,5 @@
-use crate::mm::PAGE_SIZE;
+//use crate::mm::PAGE_SIZE;
+pub const PAGE_SIZE: usize = 4096;
 use crate::process_manager::process_memory::ALLOCATION_RANGE_VIRT_START;
 use super::{allocation::AllocationRange, process::ProcessID, process_paging::ProcessPageTableRef};
 

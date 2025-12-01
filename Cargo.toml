@@ -1,0 +1,23 @@
+[package]
+name = "wallet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = { version = "0.4.17", features = ["max_level_debug", "release_max_level_debug"] }
+bitflags = "2.6"
+elf = { path = "../svsm/elf" }
+cpuarch = { path = "../svsm/cpuarch" }
+igvm_defs = { version = "0.1.9", default-features = false}
+num_enum =  { version="0.7.3", default-features = false }
+
+[features]
+boottime = []
+alloc_bench = []
+bench_mem = []
+prealloc = []
+stat = []
+breakdown = []
+no_print = []
+print = []
+no_cow = []

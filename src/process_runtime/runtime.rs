@@ -9,9 +9,12 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use num_enum::TryFromPrimitive;
 use crate::address::PhysAddr;
+use crate::interop::ap::ap_create_current;
 use crate::process_manager::process_paging::TP_LIBOS_START_VADDR;
-use crate::{address::VirtAddr, cpu::{cpuid::{cpuid_table_raw, CpuidResult}, percpu::{this_cpu, this_cpu_unsafe}}, map_paddr, mm::PerCPUPageMappingGuard, paddr_as_slice, process_manager::{process::{ProcessID, TrustedProcess, PROCESS_STORE}, process_memory::allocate_page, process_paging::{GraminePalProtFlags, ProcessPageFlags, ProcessPageTableRef}}, protocols::{errors::SvsmReqError, RequestParams}, vaddr_as_u64_slice};
+use crate::{address::VirtAddr, interop::cpuid::{cpuid_table_raw, CpuidResult}, map_paddr, paddr_as_slice, process_manager::{process::{ProcessID, TrustedProcess, PROCESS_STORE}, process_memory::allocate_page, process_paging::{GraminePalProtFlags, ProcessPageFlags, ProcessPageTableRef}}, vaddr_as_u64_slice};
+use crate::{SvsmReqError, RequestParams};
 use crate::process_manager::outb::{breakdown_outb, outb};
+use crate::memory::paging::PerCPUPageMappingGuard;
 
 use crate::vaddr_as_slice;
 use crate::types::PageSize;
@@ -23,7 +26,8 @@ use crate::process_manager::memory_channels::{INPUT_VADDR, OUTPUT_VADDR};
 #[cfg(feature = "stat")]
 use core::sync::atomic;
 
-const TRUSTLET_VMPL: u64 = 1;
+#[no_mangle]
+static TRUSTLET_VMPL: u64 = 1;
 
 pub trait ProcessRuntime {
     fn handle_process_request(&mut self) -> bool;
@@ -160,7 +164,7 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
     let string_buf: [u8;256] = [0;256];
     let string_pos: usize = 0;
     let sev_features = zygote.context.sev_features;
-    let apic_id = this_cpu().get_apic_id();
+    //let apic_id = this_cpu().get_apic_id();
 
     let mut rc = PALContext{
         process: zygote,
@@ -177,10 +181,11 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
     };
 
     loop {
-        unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
-                                                       u64::from(apic_id),
-                                                       TRUSTLET_VMPL,
-                                                       sev_features).unwrap()}
+        //unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
+        //                                               u64::from(apic_id),
+        //                                               TRUSTLET_VMPL,
+        //                                               sev_features).unwrap()}
+        ap_create_current(vmsa_paddr, TRUSTLET_VMPL, sev_features).unwrap();
         if !rc.handle_process_request(){
             break;
         }
@@ -238,7 +243,7 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     let string_pos: usize = 0;
     let sev_features = trustlet.context.sev_features;
 
-    let apic_id = this_cpu().get_apic_id();
+    //let apic_id = this_cpu().get_apic_id();
     breakdown_outb(212);
     match invocation_type {
         TrustletInvocationType::NORMAL => {
@@ -333,10 +338,11 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     // Execution loop of the trustlet
     // Currently the trustlet runs to completion
     loop {
-        unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
-                                                       u64::from(apic_id),
-                                                       TRUSTLET_VMPL,
-                                                       sev_features).unwrap()}
+        //unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
+        //                                               u64::from(apic_id),
+        //                                               TRUSTLET_VMPL,
+        //                                               sev_features).unwrap()}
+        ap_create_current(vmsa_paddr, TRUSTLET_VMPL, sev_features).unwrap();
         if !rc.handle_process_request() {
             break;
         }

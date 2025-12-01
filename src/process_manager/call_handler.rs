@@ -1,5 +1,7 @@
-use crate::protocols::errors::SvsmReqError;
-use crate::protocols::RequestParams;
+use crate::RequestParams;
+use crate::SvsmReqError;
+//use crate::protocols::errors::SvsmReqError;
+//use crate::protocols::RequestParams;
 use crate::attestation;
 use crate::process_manager::process::TrustedProcessType;
 
@@ -26,22 +28,24 @@ const GET_STAT: u32 = 100;
 const RESET_STAT: u32 = 101;
 
 pub fn get_stat(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    #[allow(unused_imports)]
     use core::sync::atomic::Ordering;
     log::error!("Stat");
-    log::error!("PVALIDATE: {}", crate::sev::utils::stat::PVALIDATE_COUNT.load(Ordering::Relaxed));
-    log::error!("PF: {}", crate::sev::utils::stat::PF_COUNT.load(Ordering::Relaxed));
-    log::error!("COW: {}", crate::sev::utils::stat::COW_COUNT.load(Ordering::Relaxed));
+    //log::error!("PVALIDATE: {}", crate::sev::utils::stat::PVALIDATE_COUNT.load(Ordering::Relaxed));
+    //log::error!("PF: {}", crate::sev::utils::stat::PF_COUNT.load(Ordering::Relaxed));
+    //log::error!("COW: {}", crate::sev::utils::stat::COW_COUNT.load(Ordering::Relaxed));
     log::error!("COW_PAGES: {}", super::process_paging::stat::COW_PAGE_COUNT.load(Ordering::Relaxed));
     log::error!("NON_COW_PAGES: {}", super::process_paging::stat::NON_COW_PAGE_COUNT.load(Ordering::Relaxed));
     Ok(())
 }
 
 pub fn reset_stat(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    #[allow(unused_imports)]
     use core::sync::atomic::Ordering;
     log::info!("Stat Reset");
-    crate::sev::utils::stat::PVALIDATE_COUNT.store(0, Ordering::Relaxed);
-    crate::sev::utils::stat::PF_COUNT.store(0, Ordering::Relaxed);
-    crate::sev::utils::stat::COW_COUNT.store(0, Ordering::Relaxed);
+    //crate::sev::utils::stat::PVALIDATE_COUNT.store(0, Ordering::Relaxed);
+    //crate::sev::utils::stat::PF_COUNT.store(0, Ordering::Relaxed);
+    //crate::sev::utils::stat::COW_COUNT.store(0, Ordering::Relaxed);
     Ok(())
 }
 
@@ -97,6 +101,8 @@ fn create_channel(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 
 pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<(), SvsmReqError> {
     breakdown_outb(254);
+    //log::info!("{}, {}, {}, {}, {}",request,params.rcx, params.rdx, params.r8, params.r9);
+    //panic!("YEAH");
     let res = match request {
         MONITOR_INIT => monitor_init(params),
         DIFF_ATTEST => diff_attestation(params),

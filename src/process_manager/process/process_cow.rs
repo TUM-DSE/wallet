@@ -1,22 +1,29 @@
+use crate::cpu::get_current_guest_vmsa;
 //use core::arch::global_asm;
-use crate::cpu::percpu::this_cpu_shared;
-use crate::mm::PAGE_SIZE;
-use crate::mm::SVSM_PERCPU_VMSA_BASE;
+//use crate::cpu::percpu::this_cpu_shared;
+//use crate::mm::PAGE_SIZE;
+pub const PAGE_SIZE: usize = 4096;
+//use crate::memory::SVSM_PERCPU_VMSA_BASE;
 use crate::process_manager::process_memory;
 use crate::process_manager::PROCESS_STORE_SIZE;
 use crate::process_manager::process_memory::allocate_page;
 use crate::process_manager::process_paging::ProcessPageTableRef;
 use crate::process_runtime::runtime::{early_invoke, MmapManager};
-use crate::protocols::errors::SvsmResultCode;
-use crate::protocols::errors::SvsmReqError;
-use crate::protocols::RequestParams;
+//use crate::protocols::errors::SvsmResultCode;
+use crate::SvsmResultCode;
+//use crate::protocols::errors::SvsmReqError;
+//use crate::protocols::RequestParams;
+use crate::RequestParams;
+use crate::SvsmReqError;
 use crate::sev::RMPFlags;
 use crate::sev::rmp_adjust;
 use crate::types::PageSize;
 use crate::address::VirtAddr;
-use crate::mm::PerCPUPageMappingGuard;
+//use crate::mm::PerCPUPageMappingGuard;
+use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::sev::utils::rmp_set_guest_vmsa;
 use crate::vaddr_as_u64_slice;
+use crate::paddr_as_u64_slice;
 use super::*;
 use cpuarch::vmsa::VMSA;
 use core::mem::replace;
@@ -26,19 +33,52 @@ use crate::attestation::monitor::{ProcessMeasurements, measure};
 
 use crate::process_manager::exception_handling::*;
 
-use crate::process_manager::outb::{breakdown_outb};
+use crate::process_manager::outb::breakdown_outb;
 
 
 impl TrustedProcess {
 
     pub fn zygote(data: u64,size: u64, pgt: u64) -> Self{
 
+        /*
+        let mut ar: [PhysAddr; 100] = [PhysAddr::from(0x1u64); 100];
+        for i in 0..100 {
+            ar[i] = allocate_page();
+            let (_m, v) = paddr_as_u64_slice!(ar[i]);
+
+            log::debug!("ADDR {:x?}/{:x?}/{:x?}",
+            _m.virt_addr(), ar[i], crate::process_manager::process_memory::ProcessMemConfig::virt_to_phys(_m.virt_addr()));
+            log::debug!("AR: {:x?}", crate::process_manager::process_memory::ProcessMemConfig::virt_to_phys(VirtAddr::from(&raw const ar)));
+            v[0] = i as u64;
+            log::debug!("RESULT: {}",v[0]);
+        }
+
+        for i in 0..100 {
+            let (_m, v) = paddr_as_u64_slice!(ar[i]);
+            log::debug!("RESULT2: {}",v[0]);
+        }
+
+        for i in 0..100 {
+            free_page(ar[i]);
+        }
+        for i in 0..100 {
+            ar[i] = allocate_page();
+            let (_m, v) = paddr_as_u64_slice!(ar[i]);
+            log::debug!("Written value: {}",v[0]);
+            v[0] = 2;
+        }
+        */
         // The Zygote is loaded in 3 files
         // We first load the a struct/array of addresses
         // that can then be used to get the next parts
+        use crate::paddr_as_table;
+        use crate::map_paddr;
+        use crate::interop::memory::read_cr3;
+        use crate::process_manager::process_paging::ProcessPageTablePage;
+        //let (m, p) = paddr_as_table!(read_cr3());
+        //log::debug!("{:x?}", p[1]);
         breakdown_outb(200);
         let (zygote_data, range) = ProcessPageTableRef::copy_data_from_guest(data, size, pgt);
-
         let zygote_data_struct = vaddr_as_u64_slice!(zygote_data);
         let pal = zygote_data_struct[0];
         let pal_size = zygote_data_struct[3];
@@ -46,14 +86,16 @@ impl TrustedProcess {
         let manifest_size = zygote_data_struct[4];
         let libos = zygote_data_struct[2];
         let libos_size= zygote_data_struct[5];
-
+        log::debug!("Test before umount and delete");
         range.unmount();
+        log::debug!("Test after unmount");
         range.delete();
-
+        log::debug!("Test after delete");
 
         let mut base = ProcessBaseContext::default();
         let mut measurements = ProcessMeasurements::default();
 
+        log::debug!("Test before copy data from guest");
         let (pal_data, pal_range) = ProcessPageTableRef::copy_data_from_guest(pal, pal_size, pgt);
         log::debug!("pal_data {:?} pal_range {:?}", pal_data, pal_range);
         base.init_with_data(pal_data, pal_size, pal_range);
@@ -63,6 +105,8 @@ impl TrustedProcess {
         pal_range.unmount();
         pal_range.delete();
         log::debug!("TODO: Compare with pal measurement of the policy");
+
+        //panic!();
 
         let (manifest_data, manifest_range) = ProcessPageTableRef::copy_data_from_guest(manifest, manifest_size, pgt);
         log::debug!("manifest_range {:?}", manifest_range);
@@ -83,6 +127,7 @@ impl TrustedProcess {
         libos_range.unmount();
         libos_range.delete();
         log::debug!("TODO: Compare with libos measurement of the policy");
+
         breakdown_outb(201);
         let mut context = ProcessContext::default();
         context.early_init(base, measurements);
@@ -145,7 +190,6 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
             // and parse it to create a page table
             let z: TrustedProcess = TrustedProcess::zygote(process_addr, size, guest_pgt);
             //context.early_init(base, measurements);
-
 
 
             // Insert it into the process store
@@ -221,25 +265,34 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), SvsmReqE
 impl ProcessContext {
 
     pub fn early_init(&mut self, base: ProcessBaseContext, measurements: ProcessMeasurements){
-
+        log::debug!("early_init");
         let page_table_ref = base.page_table_ref;
-
+        log::debug!("page_table_ref: {:x?}", page_table_ref);
         // Create VMSA for Zygote
         // Will be used as base for Trustlet VMSA
         let new_vmsa_page = allocate_page();
+        log::debug!("early_init alloc");
         let new_vmsa_mapping = PerCPUPageMappingGuard::create_4k(new_vmsa_page).unwrap();
+        log::debug!("early_init map");
         let new_vmsa_vaddr = new_vmsa_mapping.virt_addr();
+        log::debug!("early_init vadd");
 
         rmp_adjust(new_vmsa_vaddr, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
+        log::debug!("early_init rmpadjust");
         rmp_set_guest_vmsa(new_vmsa_vaddr).unwrap();
+        log::debug!("early_init set guest vmsa");
         rmp_adjust(new_vmsa_vaddr, RMPFlags::VMPL1 | RMPFlags::VMSA, PageSize::Regular).unwrap();
-
+        log::debug!("early_init rmp_adjust");
         //Guest VMSA -> New VMSA
         let vmsa = VMSA::from_virt_addr(new_vmsa_vaddr);
-        let locked = this_cpu_shared().guest_vmsa.lock();
-        let old_vmsa_ptr = unsafe { SVSM_PERCPU_VMSA_BASE.as_mut_ptr::<VMSA>().as_mut().unwrap() };
+        log::debug!("early_init vmsa from virt");
+        //let locked = this_cpu_shared().guest_vmsa.lock();
+        //let old_vmsa_ptr = unsafe { SVSM_PERCPU_VMSA_BASE.as_mut_ptr::<VMSA>().as_mut().unwrap() };
+        let old_vmsa_ptr = get_current_guest_vmsa();
+        log::debug!("early_init current vmsa");
         _ = replace(vmsa, *old_vmsa_ptr);
-        drop(locked);
+        log::debug!("early_init replace");
+        //drop(locked);
 
         //New VMSA Setup
         vmsa.vmpl = 1; // Trustlets always run in VMPL1
@@ -252,12 +305,12 @@ impl ProcessContext {
         // New Stack
         vmsa.rbp = u64::from(TP_STACK_START_VADDR)+8*4096;
         vmsa.rsp = u64::from(TP_STACK_START_VADDR)+8*4096;
-
+        log::debug!("early_init setup");
 
         // Setup exception handlers
 
         setup_exceptions(vmsa, &page_table_ref);
-
+        log::debug!("early_init exceptions");
         // ------ end of exception handlers setup
 
         let svme_mask: u64 = 1u64 << 12;
@@ -268,7 +321,7 @@ impl ProcessContext {
             log::debug!("SEV features: {}", vmsa.sev_features == vmsa.sev_features);
             panic!("Failed to create new VMSA");
         }
-
+        log::debug!("early_init checks");
 
         //Memory Channel setup -- No chain setup here
         let page_table_addr = vmsa.cr3;
@@ -277,13 +330,14 @@ impl ProcessContext {
         self.channel.allocate_input(&mut pptr, PAGE_SIZE);
         self.channel.allocate_output(&mut pptr, PAGE_SIZE);
 
+        log::debug!("channels");
+
         self.vmsa = new_vmsa_page;
         self.sev_features = vmsa.sev_features;
         //self.base = base;
         self.measurements = measurements;
         self.page_table_ref = page_table_ref;
-
-
+        log::debug!("early_init done");
     }
 
     /// This function is called to create a Trustlet from a Zygote
