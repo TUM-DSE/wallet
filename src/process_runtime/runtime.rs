@@ -9,7 +9,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use num_enum::TryFromPrimitive;
 use crate::address::PhysAddr;
-use crate::interop::ap::ap_create_current;
+use crate::interop::ap::{ap_create_current, ap_create_current2};
 use crate::process_manager::process_paging::TP_LIBOS_START_VADDR;
 use crate::{address::VirtAddr, interop::cpuid::{cpuid_table_raw, CpuidResult}, map_paddr, paddr_as_slice, process_manager::{process::{ProcessID, TrustedProcess, PROCESS_STORE}, process_memory::allocate_page, process_paging::{GraminePalProtFlags, ProcessPageFlags, ProcessPageTableRef}}, vaddr_as_u64_slice};
 use crate::{SvsmReqError, RequestParams};
@@ -158,12 +158,15 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         //let zygote = PROCESS_STORE.get(ProcessID(id.try_into().unwrap()));
 
     let vmsa_paddr = zygote.context.vmsa;
+    log::debug!("VMSA: {:x?}",vmsa_paddr);
     let vmsa_mapping = PerCPUPageMappingGuard::create_4k(zygote.context.vmsa).unwrap();
+    log::debug!("VMSA Mapping: {:x?}", vmsa_mapping.vaddr);
     let vmsa: &mut VMSA = unsafe { vmsa_mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap() };
-
+    let vmsa_s: &'static VMSA = unsafe { vmsa_mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap() };
     let string_buf: [u8;256] = [0;256];
     let string_pos: usize = 0;
     let sev_features = zygote.context.sev_features;
+    log::debug!("Setting up features");
     //let apic_id = this_cpu().get_apic_id();
 
     let mut rc = PALContext{
@@ -179,13 +182,14 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         invocation_arg_size: 0,
         return_value: 0,
     };
-
+    log::debug!("Current context");
+    log::debug!("{:?}", vmsa_s);
     loop {
         //unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
         //                                               u64::from(apic_id),
         //                                               TRUSTLET_VMPL,
         //                                               sev_features).unwrap()}
-        ap_create_current(vmsa_paddr, TRUSTLET_VMPL, sev_features).unwrap();
+        let r = ap_create_current2(vmsa_paddr, TRUSTLET_VMPL, sev_features);
         if !rc.handle_process_request(){
             break;
         }
@@ -342,7 +346,7 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
         //                                               u64::from(apic_id),
         //                                               TRUSTLET_VMPL,
         //                                               sev_features).unwrap()}
-        ap_create_current(vmsa_paddr, TRUSTLET_VMPL, sev_features).unwrap();
+        ap_create_current(vmsa_paddr, TRUSTLET_VMPL, sev_features);
         if !rc.handle_process_request() {
             break;
         }

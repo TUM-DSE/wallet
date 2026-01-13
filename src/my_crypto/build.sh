@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-SSEFLAGS="-mno-sse -mno-sse2 -mno-avx -fno-tree-vectorize"
-#SSEFLAGS="-march=native -O3"
+#SSEFLAGS="-mno-sse -mno-sse2 -mno-avx -fno-tree-vectorize"
+SSEFLAGS="-march=native -mno-avx512f -O3"
 
 gcc $SSEFLAGS -nostdlib -Ihacl/karamel/ -Ihacl/karamel/krmllib/dist/minimal -Ihacl/karamel/include/ -fPIC -mrdrnd \
 	 -c my_crypto.c  

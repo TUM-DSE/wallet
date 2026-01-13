@@ -52,15 +52,16 @@ impl AllocationRange {
 
 
         for i in 0..(pages as usize) {
-            log::debug!("allocate_: {}", i);
+            //log::debug!("allocate_: {}", i);
             let current_page = allocate_page();
+            //log::debug!("New data page: {:x?}", current_page);
             if !mount {
                 let (mapping, _page_mapped) = paddr_as_slice!(current_page);
                 let _ = rmp_adjust(mapping.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular);
             }
             page_table_ref.map_4k_page(start_address + i * PAGE_SIZE, current_page, table_flags);
         };
-
+        //log::debug!("Done");
 
         if mount {
             let (_mapping, pgd) = paddr_as_slice!(read_cr3());
@@ -138,13 +139,16 @@ impl AllocationRange {
                     if !pte_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
                         break
                     }
-                    log::debug!("Freeing: {:x?}", strip_paddr!(pte_table_entry.0));
+                    //log::debug!("Freeing PTE: {:x?}", strip_paddr!(pte_table_entry.0));
                     free_page(strip_paddr!(pte_table_entry.0));
                 }
+                //log::debug!("Freeing PMD: {:x?}", strip_paddr!(pmd_table_entry.0));
                 free_page(strip_paddr!(pmd_table_entry.0));
             }
+            //log::debug!("Freeing PUD: {:x?}", strip_paddr!(pud_table_entry.0));
             free_page(strip_paddr!(pud_table_entry.0));
         }
+        //log::debug!("Freeing PGD: {:x?}", strip_paddr!(pgd_table_entry.0));
         free_page(strip_paddr!(pgd_table_entry.0));
     }
 }

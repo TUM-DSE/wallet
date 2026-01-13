@@ -182,7 +182,6 @@ pub fn setup_exceptions(vmsa: &mut VMSA, page_table_ref: &ProcessPageTableRef) {
         limit: limit-1,
     };
     vmsa.idt = vmsa_idt;
-    log::debug!("M8888");
     // setup TSS
     //let mut tss = tss_trustlet_mut();
     const TSS_VADDR: u64 = TP_KERN_STACK_START_VADDR + 4096*2;
@@ -193,20 +192,14 @@ pub fn setup_exceptions(vmsa: &mut VMSA, page_table_ref: &ProcessPageTableRef) {
     #[allow(unused_variables)]
     let tss_base = TSS_VADDR;//tss.base();
     let num_page = 1;
-    log::debug!("M8888i9");
 
     // 1. setup kernel stack address
     tss.stacks[0] = (TP_KERN_STACK_START_VADDR + 4096*num_page).into();
-    log::debug!("M88888i19");
     // 2. map the stack address to trustlet's page table
-    log::debug!("{:x?} {:x?} {:x?}", page_table_ref,
-    TP_KERN_STACK_START_VADDR, num_page);
-    page_table_ref.add_stack(TP_KERN_STACK_START_VADDR.into(), num_page);
     // 3. map the TSS to trustlet's page table
     //let tss_phys = svsm_page_table_ref.virt_to_phys(tss_base.into());
     //assert!(tss_phys != PhysAddr::null());
     //assert!(page_table_ref.virt_to_phys(tss_base.into()) == PhysAddr::null());
-    log::debug!("M555");
     page_table_ref.map_4k_page(TSS_VADDR.into(), tss_phys, ProcessPageFlags::data());
     // 4. rmpadjust for TSS
     rmp_adjust(tss_vaddr, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
@@ -227,7 +220,6 @@ pub fn setup_exceptions(vmsa: &mut VMSA, page_table_ref: &ProcessPageTableRef) {
     // 4. data_64_user
     // 5. null
     // 6-7. TSS
-    log::debug!("M444");
     let mut desc0: u64 = 0;
     let mut desc1: u64 = 0;
     desc0 |= TSS_LIMIT & 0xffffu64;
@@ -240,7 +232,6 @@ pub fn setup_exceptions(vmsa: &mut VMSA, page_table_ref: &ProcessPageTableRef) {
 
     let desc0 = GDTEntry::from_raw(desc0);
     let desc1 = GDTEntry::from_raw(desc1);
-    log::debug!("M3333");
     //let (desc0, desc1) = tss.to_gdt_entry();
     unsafe{
         // this sets the entry 6 for TSS

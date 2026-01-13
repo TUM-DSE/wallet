@@ -86,8 +86,10 @@ impl SvsmReqError {
     }
 }
 
+use crate::process_manager::monitor_init;
 pub fn wallet_memory_init() {
-    let _ = additional_monitor_memory_init();
+    monitor_init();
+    //let _ = additional_monitor_memory_init();
 }
 
 pub fn wallet_process_protocol_request(request: u32, params: &mut RequestParams) -> i64 {

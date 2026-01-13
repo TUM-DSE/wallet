@@ -605,14 +605,10 @@ impl ProcessPageTableRef {
     pub fn add_stack(&self, start: VirtAddr, size: u64){
         log::debug!("Does it get here?");
         for i in 0..(size as usize) {
-            log::debug!("Stack Page {}", i);
             let new_page = allocate_page();
             let (mapping, s) = paddr_as_slice!(new_page);
-            log::debug!("Write Stack");
             _ = replace(s, ZERO_PAGE);
-            log::debug!("Add Stack");
             self.map_4k_page(start + i * PAGE_SIZE, new_page, ProcessPageFlags::data());
-            log::debug!("adjust stack");
             rmp_adjust(mapping.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX , PageSize::Regular).unwrap();
         }
     }
@@ -632,27 +628,36 @@ impl ProcessPageTableRef {
 
     pub fn copy_address_range(&self, origin: VirtAddr, size: u64, target: VirtAddr) {
         //All copies extend to the complete page
+
         let copy_page_count = size / PAGE_SIZE_4K;
         for i in 0..copy_page_count {
             // Mapping the src, dst to as u64;512 slices
             let origin_phys = self.get_page(origin + 4096usize * (i as usize));
             let (_mapping,origin_slice) = paddr_as_slice!(origin_phys);
+            //use crate::process_manager::memory_helper::ZERO_PAGE;
+            //et origin_slice = unsafe { &*(&ZERO_PAGE as *const [u64;512] as *const [u64;512]) };;
             let target_vaddr = target + 4096usize * (i as usize);
             let target_slice = vaddr_as_slice!(target_vaddr);
 
 
+
             //log::debug!("Origin: {:x?}/{:x?}, target: {:x?}/{:x?}",
             //origin_phys, _mapping.virt_addr(), target_vaddr, super::process_memory::ProcessMemConfig::virt_to_phys(target_vaddr));
+            //log::debug!("Origin: {:x?}/{:x?}, target: {:x?}",origin_phys, _mapping.virt_addr(), target_vaddr);
+
             let cr3 = crate::interop::memory::read_cr3();
             let (_m1, pt) = paddr_as_u64_slice!(cr3);
             let (_m2, pt2) = paddr_as_u64_slice!(strip_paddr!(pt[6].into()));
             let (_m3, pt3) = paddr_as_u64_slice!(strip_paddr!(pt2[0].into()));
             let (_m4, pt4) = paddr_as_u64_slice!(strip_paddr!(pt3[0].into()));
-
+            //log::debug!("Target: {:x?}", pt4);
+            //log::debug!("0: {:x?}\n1: {:x?}\n2: {:x?}\n3:{:x?}", pt, pt2, pt3, pt4);
             //let a = origin_slice[0];
 
             // Copying the src to dst
+            //log::debug!("AHHHH");
             _ = replace(target_slice, *origin_slice);
+            //log::debug!("AHHHH2");
         }
     }
 
@@ -823,6 +828,8 @@ impl ProcessPageTableRef {
         let copy_size = size + (PAGE_SIZE_4K - size % PAGE_SIZE_4K); //Extend size ot full page size
         let copy_page_count = copy_size / PAGE_SIZE_4K;
         let mut alloc_range = AllocationRange(0,0);
+
+        //log::debug!("Pages to allocate: {}", copy_page_count);
         // panic is triggered
         alloc_range.allocate(copy_page_count);
         // Assert is triggered
@@ -832,6 +839,23 @@ impl ProcessPageTableRef {
         page_table_ref.copy_address_range(VirtAddr::from(addr), copy_size, target);
         (target, alloc_range)
     }
+
+    pub fn copy_data_from_guest2(addr: u64, size: u64, page_table: u64) -> (VirtAddr, AllocationRange){
+        let copy_size = size + (PAGE_SIZE_4K - size % PAGE_SIZE_4K); //Extend size ot full page size
+        let copy_page_count = copy_size / PAGE_SIZE_4K;
+        let mut alloc_range = AllocationRange(0,0);
+
+        //log::debug!("Pages to allocate: {}", copy_page_count);
+        // panic is triggered
+        alloc_range.allocate(copy_page_count);
+        // Assert is triggered
+        let target = VirtAddr::from(ALLOCATION_RANGE_VIRT_START);
+        let mut page_table_ref = ProcessPageTableRef::default();
+        page_table_ref.set_external_table(page_table);
+        page_table_ref.copy_address_range(VirtAddr::from(addr), copy_size, target);
+        (target, alloc_range)
+    }
+
 
     pub fn copy_data_from_guest_to(addr: u64, size: u64, page_table: u64, dst: u64) {
         let copy_size = size + (PAGE_SIZE_4K - size % PAGE_SIZE_4K);

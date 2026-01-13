@@ -215,10 +215,10 @@ impl ProcessMemConfig{
         let mapping = PerCPUPageMappingGuard::create_4k(PhysAddr::from(addr)).unwrap();
         let virt = mapping.virt_addr();
         let entry: &mut [u64;512] = unsafe { &mut *virt.as_mut_ptr::<[u64;512]>() };
-        log::debug!("Validating page: {:x?}", PhysAddr::from(addr));
+        //log::debug!("Validating page: {:x?}", PhysAddr::from(addr));
         monitor_pvalidate_vaddr_4k(virt, PhysAddr::from(addr)).unwrap();
 
-        log::debug!("Clearing page: {:x?}", virt);
+        //log::debug!("Clearing page: {:x?}", virt);
         use crate::strip_paddr;
         use crate::process_manager::memory_helper::strip_c_bit;
         let a:usize = ((u64::from(virt) >> 12) & 0xFF).try_into().unwrap();
@@ -226,7 +226,7 @@ impl ProcessMemConfig{
         let (_m2, pud) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pgd[510])));
         let (_m3, pmd) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pud[1])));
         let (_m4, pte) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pmd[0])));
-        log::debug!("PhysAddr({}): {:x?}",a, pte[a] );
+        //log::debug!("PhysAddr({}): {:x?}",a, pte[a] );
         for i in 0..512 {
             entry[i] = 0;
         }
@@ -323,34 +323,17 @@ impl ProcessMemConfig{
 
 
     fn check_for_free_page(&mut self) -> PhysAddr {
-        //log::debug!("self.free_page_list_used_len: {}", self.free_page_list_used_len);
         if self.free_page_list_used_len == 0 {
             return PhysAddr::null();
         }
         self.free_page_list_used_len -= 1;
         let addr = self.free_page_list + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH);
         let entry: &mut PhysAddr = unsafe {&mut *((addr) as *mut PhysAddr)};
-
-        log::debug!("New address: {:x?}", entry);
         let tmp = *entry;
         *entry = PhysAddr::null();
-        log::debug!("rmp adjust");
+
         let (mapping, a) = paddr_as_u64_slice!(tmp);
-        rmp_adjust(mapping.virt_addr(), RMPFlags::VMPL0 | RMPFlags::RWX , PageSize::Regular);
-        use crate::process_manager::memory_helper::strip_c_bit;
-        use crate::strip_paddr;
-        let b:usize = ((u64::from(mapping.virt_addr()) >> 12) & 0xFF).try_into().unwrap();
-        let (_m1, pgd) = paddr_as_u64_slice!(read_cr3());
-        let (_m2, pud) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pgd[510])));
-        let (_m3, pmd) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pud[1])));
-        let (_m4, pte) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pmd[0])));
-        //let (_m5, result) = paddr_as_u64_slice!(strip_paddr!(PhysAddr::from(pte[4])));
-        log::debug!("Result({}): {:x?}", b, pte[b]);
-        log::debug!("Test write: {:x?}, {:x?}", mapping.virt_addr(), tmp);
-        a[0] = 0;
-        log::debug!("zeroing");
         a.fill(0);
-        log::debug!("Returning");
         tmp
     }
 
@@ -370,6 +353,8 @@ impl ProcessMemConfig{
         let idx = self.free_page_list_used_len as u64;
         let addr = self.free_page_list + (idx * 8);
         let ptr = addr as *mut u64;
+                log::debug!("Deleting {:x?} to index {}", paddr, idx);
+        panic!();
         let r: &mut u64 = unsafe{&mut *ptr};
         *r = paddr;
         self.free_page_list_used_len += 1;
@@ -379,7 +364,6 @@ impl ProcessMemConfig{
     pub fn get_next_page(&mut self) -> PhysAddr {
         let addr = PhysAddr::from(self.page_base);
         ProcessMemConfig::validate_and_clear(u64::from(addr));
-        self.page_base = self.page_base + PAGE_SIZE;
         return addr;
     }
 
@@ -390,6 +374,12 @@ impl ProcessMemConfig{
             ProcessMemConfig::validate_and_clear(u64::from(addr));
             self.page_base = self.page_base + PAGE_SIZE;
         }
+            //for addr2 in (self.free_page_list..(self.free_page_list + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH)))
+            //    .step_by(ADDRESS_LENGTH as usize) {
+            //    unsafe { log::debug!("LIST: {:x?}/{:x?}", *(addr2 as *mut PhysAddr), addr); }
+            //}
+
+
         addr
     }
 
@@ -397,15 +387,19 @@ impl ProcessMemConfig{
         debug_assert_eq!(free.bits() & PAGE_SIZE - 1, 0);
 
         if cfg!(debug_assertions) {
-            for addr in (self.free_page_list..(self.free_page_list + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH))).step_by(ADDRESS_LENGTH as usize) {
+            for addr in (self.free_page_list..(self.free_page_list + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH)))
+                .step_by(ADDRESS_LENGTH as usize) {
+                //unsafe { log::debug!("{:x?}/{:x?}", *(addr as *mut PhysAddr), free); }
                 unsafe { assert_ne!(*(addr as *mut PhysAddr), free); }
             }
 
             // This check does does not make sense free.bits should never be in this range
             if free.bits() < 0x100c00000 || free.bits() > 0x10e000000 {
-                log::info!("freeing wrong page? {:#x}", free);
+                //log::info!("freeing wrong page? {:#x}", free);
             }
         }
+        //        log::debug!("Deleting {:x?} to index {}", free, self.free_page_list_used_len);
+
         //log::debug!("Page List: {:x?}, offset: {:x?}({:?})", self.free_page_list, self.free_page_list_used_len as u64 * ADDRESS_LENGTH, self.free_page_list_used_len);
         let addr = self.free_page_list + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH);
         let entry = addr as *mut PhysAddr;
@@ -423,13 +417,17 @@ impl ProcessMemConfig{
     pub fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
         let pgd_table = ProcessMemConfig::get_current_pagetable_as_u64_slice();
         let mut addr = pgd_table[addr_to_idx(usize::from(vaddr), PGD)];
+
         let (_pud_mapping, pud_table) = paddr_as_u64_slice!(PhysAddr::from(addr & 0xFFFFFFFFFFFFE000));
-        addr = pud_table[addr_to_idx(usize::from(vaddr), PUD)];
-        let (_pmd_mapping, pmd_table) = paddr_as_u64_slice!(PhysAddr::from(addr & 0xFFFFFFFFFFFFE000));
+        log::debug!("WHAT: {}",addr_to_idx(usize::from(vaddr), PUD));
+        //addr = pud_table[addr_to_idx(usize::from(vaddr), PUD)];
+        return PhysAddr::null();
+
+        /*let (_pmd_mapping, pmd_table) = paddr_as_u64_slice!(PhysAddr::from(addr & 0xFFFFFFFFFFFFE000));
         addr = pmd_table[addr_to_idx(usize::from(vaddr), PMD)];
         let (_pte_mapping, pte_table) = paddr_as_u64_slice!(PhysAddr::from(addr & 0xFFFFFFFFFFFFE000));
         addr = pte_table[addr_to_idx(usize::from(vaddr), PTE)];
-        PhysAddr::from(addr & 0xFFFFFFFFFFFFE000)
+        PhysAddr::from(addr & 0xFFFFFFFFFFFFE000)*/
     }
 
     pub fn test(&self) {
@@ -464,8 +462,27 @@ pub fn allocated_amount() -> usize {
     PROCESS_MEM_CONFIG.lock().allocated_amount()
 }
 
+use crate::process_manager::allocation::AllocationRange;
+fn test_allocation() {
+    log::debug!("Testing memory range allocation");
+    let mut alloc_range1 = AllocationRange(0,0);
+    alloc_range1.allocate(2);
+    log::debug!("Trying to free first allocation");
+    alloc_range1.delete();
+    alloc_range1.unmount();
+    log::debug!("First allocation done");
+    let mut alloc_range2 = AllocationRange(0,0);
+    alloc_range2.allocate(10);
+    log::debug!("Trying to free second allocation");
+    alloc_range2.delete();
+    log::debug!("Second allocation done");
+    alloc_range2.unmount();
+}
+
 pub fn additional_monitor_memory_init() -> Result<(), SvsmError> {
     PROCESS_MEM_CONFIG.lock().init();
+    //test_allocation();
+    //panic!("AHHHH");
     Ok(())
 }
 
@@ -475,7 +492,7 @@ pub fn add_monitor_memory() -> Result<(), SvsmError>{
 }
 
 fn monitor_pvalidate_vaddr_4k(vaddr: VirtAddr, paddr: PhysAddr) -> Result<(), SvsmReqError>{
-    log::debug!("pvalidating: {:x?}", paddr);
+    //log::debug!("pvalidating: {:x?}", paddr);
     monitor_pvalidate_vaddr(vaddr, paddr,PAGE_SIZE, PageSize::Regular, PvalidateOp::Valid, false)
 }
 use crate::process_manager::process_paging::ProcessPageTableRef;
