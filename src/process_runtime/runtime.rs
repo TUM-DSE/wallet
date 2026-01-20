@@ -342,7 +342,7 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
         //                                               u64::from(apic_id),
         //                                               TRUSTLET_VMPL,
         //                                               sev_features).unwrap()}
-        ap_create_current(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+        ap_create_current2(vmsa_paddr, TRUSTLET_VMPL, sev_features);
         if !rc.handle_process_request() {
             break;
         }
