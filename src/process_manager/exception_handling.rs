@@ -193,6 +193,13 @@ pub fn setup_exceptions(vmsa: &mut VMSA, page_table_ref: &ProcessPageTableRef) {
     let tss_base = TSS_VADDR;//tss.base();
     let num_page = 1;
 
+    // allocate kernel stacks
+    let kern_stack = allocate_page();
+    let kern_stack_mapping = PerCPUPageMappingGuard::create_4k(kern_stack).unwrap();
+    let kern_stack_vaddr = kern_stack_mapping.virt_addr();
+    page_table_ref.map_4k_page(TP_KERN_STACK_START_VADDR.into(), kern_stack, ProcessPageFlags::data());
+    rmp_adjust(kern_stack_vaddr, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
+
     // 1. setup kernel stack address
     tss.stacks[0] = (TP_KERN_STACK_START_VADDR + 4096*num_page).into();
     // 2. map the stack address to trustlet's page table
