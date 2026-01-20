@@ -158,7 +158,6 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         //let zygote = PROCESS_STORE.get(ProcessID(id.try_into().unwrap()));
 
     let vmsa_paddr = zygote.context.vmsa;
-    log::debug!("VMSA: {:x?}",vmsa_paddr);
     let vmsa_mapping = PerCPUPageMappingGuard::create_4k(zygote.context.vmsa).unwrap();
     log::debug!("VMSA Mapping: {:x?}", vmsa_mapping.vaddr);
     let vmsa: &mut VMSA = unsafe { vmsa_mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap() };
@@ -182,8 +181,6 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         invocation_arg_size: 0,
         return_value: 0,
     };
-    log::debug!("Current context");
-    log::debug!("{:?}", vmsa_s);
     loop {
         //unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
         //                                               u64::from(apic_id),
@@ -242,7 +239,6 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     let vmsa_paddr = trustlet.context.vmsa;
     let vmsa_mapping = PerCPUPageMappingGuard::create_4k(trustlet.context.vmsa).unwrap();
     let vmsa: &mut VMSA = unsafe { vmsa_mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap() };
-
     let string_buf: [u8;256] = [0;256];
     let string_pos: usize = 0;
     let sev_features = trustlet.context.sev_features;
@@ -417,7 +413,6 @@ impl ProcessRuntime for PALContext  {
         let vmsa = &mut self.vmsa;
         let rax = vmsa.rax;
         let rip = vmsa.rip;
-
         // Advance the trustlet's rip for the next execution (cpuid instruction is 2 bytes)
         vmsa.rip += 2;
 
