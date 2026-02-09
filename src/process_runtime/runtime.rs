@@ -9,7 +9,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use num_enum::TryFromPrimitive;
 use crate::address::PhysAddr;
-use crate::interop::ap::{ap_create_current, ap_create_current2};
+use crate::interop::ap::{register_guest_vmsa, switch_to_vmpl};
 use crate::process_manager::process_paging::TP_LIBOS_START_VADDR;
 use crate::{address::VirtAddr, interop::cpuid::{cpuid_table_raw, CpuidResult}, map_paddr, paddr_as_slice, process_manager::{process::{ProcessID, TrustedProcess, PROCESS_STORE}, process_memory::allocate_page, process_paging::{GraminePalProtFlags, ProcessPageFlags, ProcessPageTableRef}}, vaddr_as_u64_slice};
 use crate::{SvsmReqError, RequestParams};
@@ -51,6 +51,7 @@ pub trait ProcessRuntime {
     fn pal_svsm_inflate_channel(&mut self) -> bool;
     fn pal_nop(&mut self) -> bool;
     fn pal_svsm_finalize(&mut self) -> bool;
+    fn pal_inference(&mut self) -> bool;
 }
 
 /// Invocation type of invokeTrustlet
@@ -75,6 +76,10 @@ enum TrustletReturnType {
     OPEN=4,
     READ=5,
     MMAP=6,
+    MODEL=10,
+    LORA=11,
+    ENGINE=12,
+    INFERENCE=13
 }
 
 /// Guest request type from the trustlet (PAL)
@@ -85,6 +90,16 @@ enum PalSvsmGuestRequestType {
     OPEN=1,
     READ=2,
 }
+
+#[derive(Debug,Clone,Copy,Eq,PartialEq,TryFromPrimitive)]
+#[repr(u64)]
+enum PalInferenceRequestType {
+    MODEL=0,
+    LORA=1,
+    ENGINE=2,
+    INFERENCE=3,
+}
+
 
 #[derive(Debug, Clone, Copy)]
 pub struct MmapInfo {
@@ -181,12 +196,11 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         invocation_arg_size: 0,
         return_value: 0,
     };
+
+    _ = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+
     loop {
-        //unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
-        //                                               u64::from(apic_id),
-        //                                               TRUSTLET_VMPL,
-        //                                               sev_features).unwrap()}
-        let r = ap_create_current2(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+        switch_to_vmpl(TRUSTLET_VMPL);
         if !rc.handle_process_request(){
             break;
         }
@@ -234,6 +248,19 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     range.delete();
 
     let trustlet = PROCESS_STORE.get(ProcessID(id.try_into().unwrap()));
+
+    /*log::debug!("{:x?}", trustlet.infer_context);
+    let (_m, p) = paddr_as_slice!(trustlet.context.page_table_ref.process_page_table);
+    log::debug!("{:x?}", p[7]);
+    log::debug!("{:x?}", p[6]);
+    use crate::strip_paddr;
+    use crate::process_manager::memory_helper::strip_c_bit;
+    let (_m2, p2) = paddr_as_slice!(strip_paddr!(p[7].into()));
+    log::debug!("{:x?}", p2[0]);
+    let (_m2, p2) = paddr_as_slice!(strip_paddr!(p[6].into()));
+    log::debug!("{:x?}", p2[0]);
+
+    //panic!();*/
 
     // Getting the current processes VMSA
     let vmsa_paddr = trustlet.context.vmsa;
@@ -337,12 +364,11 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 
     // Execution loop of the trustlet
     // Currently the trustlet runs to completion
+
+    _ = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+
     loop {
-        //unsafe {(*(*this_cpu_unsafe()).ghcb).ap_create(vmsa_paddr,
-        //                                               u64::from(apic_id),
-        //                                               TRUSTLET_VMPL,
-        //                                               sev_features).unwrap()}
-        ap_create_current2(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+        switch_to_vmpl(TRUSTLET_VMPL);
         if !rc.handle_process_request() {
             break;
         }
@@ -458,6 +484,11 @@ impl ProcessRuntime for PALContext  {
             0x4FFFFFF4 => {
                 return self.pal_svsm_finalize();
             }
+
+            0x4FFFFFF3 => {
+                return self.pal_inference();
+            }
+
             // monitor calls (other)
             0x4EFFFFFF => {
                 return self.handle_exception();
@@ -1071,6 +1102,60 @@ impl ProcessRuntime for PALContext  {
         false
     }
 
+    fn pal_inference(&mut self) -> bool {
+        let request_type: PalInferenceRequestType = self.vmsa.rcx.try_into().unwrap();
+
+        if request_type != PalInferenceRequestType::INFERENCE {
+
+            let page_table = self.vmsa.cr3;
+            let mut page_table_ref = ProcessPageTableRef::default();
+            page_table_ref.set_external_table(page_table);
+
+            use crate::process_manager::memory_channels::INFERENCE_VADDR;
+            let paddr = page_table_ref.get_page(VirtAddr::from(INFERENCE_VADDR));
+            let (_mapping, addr_mapping) = map_paddr!(paddr);
+            let content: *const [u8; 64] = unsafe { addr_mapping.as_ptr::<[u8; 64]>() };
+            let bytes: [u8; 64] = unsafe { *content };
+            log::debug!("{:x?}",bytes);
+
+            let id = match request_type {
+                PalInferenceRequestType::MODEL => {
+                    use crate::model_store::model::MODEL_STORE;
+                    self.return_value = TrustletReturnType::MODEL as u64;
+                    MODEL_STORE.find(bytes)
+                }
+                PalInferenceRequestType::LORA => {
+                    use crate::model_store::model::LORA_STORE;
+                    self.return_value = TrustletReturnType::LORA as u64;
+                    LORA_STORE.find(bytes)
+                }
+                PalInferenceRequestType::ENGINE => {
+                    use crate::model_store::model::ENGINE_STORE;
+                    self.return_value = TrustletReturnType::ENGINE as u64;
+                    ENGINE_STORE.find(bytes)
+                }
+                _ => -1
+            };
+
+            let data_size = 129;
+            let mut guest_page_table_ref = ProcessPageTableRef::default();
+            guest_page_table_ref.set_external_table(self.guest_page_table);
+            let arg_page = guest_page_table_ref.get_page(VirtAddr::from(self.invocation_arg_guest_vaddr));
+            let (_mapping, arg_mapping) = map_paddr!(arg_page);
+            let arg = unsafe { core::slice::from_raw_parts_mut(arg_mapping.as_mut_ptr::<i64>(), self.invocation_arg_size) };
+            arg[128] = id;
+
+            log::debug!("{:x?}/{:x?}", id, self.return_value);
+            //let slice = unsafe {core::slice::from_raw_parts(content, len as usize)};
+            return false;
+
+        } else {
+            self.return_value = TrustletReturnType::INFERENCE as u64;
+            return false;
+        }
+        return false
+    }
+
     /// Handle an exception occured in the trustlet
     // XXX: Currently this function assumes that the exception is a #PF
     fn handle_exception(&mut self) -> bool {
@@ -1347,4 +1432,28 @@ impl ProcessRuntime for PALContext  {
         log::info!(" [Trustlet] ---------------------------------");
         false
     }
+}
+
+pub fn infer_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let tid = params.rcx;
+    let guest_pgt = params.rdx;
+    let trustlet = PROCESS_STORE.get(ProcessID(tid.try_into().unwrap()));
+
+    let (_map, page_table) = paddr_as_slice!(guest_pgt.into());
+    trustlet.infer_context.guest_write_access();
+    page_table[1] = trustlet.infer_context.0;
+
+    Ok(())
+}
+
+pub fn infer_call_ret(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let tid = params.rcx;
+    let guest_pgt = params.rdx;
+    let trustlet = PROCESS_STORE.get(ProcessID(tid.try_into().unwrap()));
+
+    let (_map, page_table) = paddr_as_slice!(guest_pgt.into());
+    trustlet.infer_context.guest_remove_write_access();
+    page_table[1] = 0;
+
+    Ok(())
 }

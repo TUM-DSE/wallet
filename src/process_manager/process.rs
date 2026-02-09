@@ -172,6 +172,7 @@ pub struct TrustedProcess {
     pub context: ProcessContext,
     pub mmap_manager: MmapManager,
     pub pf_target_vaddr: u64,
+    pub infer_context: AllocationRange,
 }
 
 impl ProcessBaseContext {
@@ -221,6 +222,9 @@ impl TrustedProcess {
         let measurements: ProcessMeasurements = process.measurements;
         let mut context = ProcessContext::default();
         context.init(base, measurements, process.context);
+        let mut inf = AllocationRange(0,0);
+        //inf.allocate_trustlet(512);
+        //inf.allocate_inference(512);
 
         TrustedProcess {
             process_type: TrustedProcessType::Trustlet,
@@ -231,6 +235,7 @@ impl TrustedProcess {
             context,
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
+            infer_context: inf,
         }
 
     }
@@ -271,6 +276,7 @@ impl TrustedProcess {
             context: ProcessContext::default(),
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
+            infer_context: AllocationRange(0,0),
         }
     }
 }

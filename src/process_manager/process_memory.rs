@@ -44,7 +44,7 @@ use core::ptr::replace;
 use super::memory_helper::ZERO_PAGE;
 
 const PREALLOCATED_SIZE: u64 = 4194304; // 16 GiB
-const ADDITIONAL_GUEST_MEMORY: usize = 8 * GiB;
+const ADDITIONAL_GUEST_MEMORY: usize = 32 * GiB;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

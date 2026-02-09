@@ -33,8 +33,76 @@ impl AllocationRange {
         //page_table_ref.print_table();
     }
 
+    pub fn allocate_trustlet(&mut self, pages: u64){
+        let mut page_table_ref = ProcessPageTableRef::default();
+        page_table_ref.set_external_table(read_cr3().bits() as u64);
+        self.allocate_(&mut page_table_ref, pages, ALLOCATION_VADDR_START, false, true);
+    }
+
     pub fn allocate_with_start_addr(&mut self, page_table_ref: &mut ProcessPageTableRef, pages: u64, start_addr: u64){
         self.allocate_(page_table_ref, pages, start_addr, false, true);
+    }
+
+    pub fn allocate_for_guest(&mut self, pages: u64) {
+        let mut page_table_ref = ProcessPageTableRef::default();
+        page_table_ref.set_external_table(read_cr3().bits() as u64);
+        self.allocate_(&mut page_table_ref, pages, ALLOCATION_VADDR_START, true, true)
+    }
+
+    pub fn guest_write_access(&mut self){
+
+        let pgd_table_entry = ProcessPageTableEntry(PhysAddr::from(self.0));
+        let (mapping1, pud_table) = paddr_as_table!(strip_paddr!(pgd_table_entry.0));
+        let _  = rmp_adjust(mapping1.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
+        for i in 0..512 {
+            let pud_table_entry = pud_table[i];
+            if !pud_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                break
+            }
+
+            let (mapping2, pmd_table) = paddr_as_table!(strip_paddr!(pud_table_entry.0));
+            let _  = rmp_adjust(mapping2.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
+            for i in 0..512 {
+                let pmd_table_entry = pmd_table[i];
+                if !pmd_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                    break
+                }
+
+                let (mapping3, pte_table) = paddr_as_table!(strip_paddr!(pmd_table_entry.0));
+                let _  = rmp_adjust(mapping3.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
+            }
+        }
+        for i in 0..(self.1 as usize) {
+            let _ = rmp_adjust((ALLOCATION_VADDR_START as usize + i * PAGE_SIZE).into(), RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
+        }
+    }
+    pub fn guest_remove_write_access(&mut self) {
+        let pgd_table_entry = ProcessPageTableEntry(PhysAddr::from(self.0));
+        let (mapping1, pud_table) = paddr_as_table!(strip_paddr!(pgd_table_entry.0));
+        let _  = rmp_adjust(mapping1.virt_addr(), RMPFlags::VMPL2 | RMPFlags::READ, PageSize::Regular);
+        for i in 0..512 {
+            let pud_table_entry = pud_table[i];
+            if !pud_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                break
+            }
+
+            let (mapping2, pmd_table) = paddr_as_table!(strip_paddr!(pud_table_entry.0));
+            let _  = rmp_adjust(mapping2.virt_addr(), RMPFlags::VMPL2 | RMPFlags::READ, PageSize::Regular);
+            for i in 0..512 {
+                let pmd_table_entry = pmd_table[i];
+                if !pmd_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                    break
+                }
+
+                let (mapping3, pte_table) = paddr_as_table!(strip_paddr!(pmd_table_entry.0));
+                let _  = rmp_adjust(mapping3.virt_addr(), RMPFlags::VMPL2 | RMPFlags::READ, PageSize::Regular);
+            }
+        }
+
+        for i in 0..(self.1 as usize) {
+            let _ = rmp_adjust((ALLOCATION_VADDR_START as usize + i * PAGE_SIZE).into(), RMPFlags::VMPL2 | RMPFlags::READ, PageSize::Regular);
+        }
+
     }
 
     fn allocate_(&mut self, page_table_ref: &mut ProcessPageTableRef, pages: u64, start_addr: u64, mount: bool, user: bool){

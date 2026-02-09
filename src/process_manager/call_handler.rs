@@ -27,6 +27,22 @@ const SEND_POLICY: u32 = 31;
 const GET_STAT: u32 = 100;
 const RESET_STAT: u32 = 101;
 
+// Model Store
+const MODEL_LOAD_INIT: u32 = 50;
+const MODEL_LOAD_DATA: u32 = 51;
+const MODEL_DELETE: u32 = 52;
+const LORA_LOAD_INIT: u32 = 53;
+const LORA_LOAD_DATA: u32 = 54;
+const LORA_DELETE: u32 = 55;
+
+// Engines
+const ENGINE_LOAD_INIT: u32 = 60;
+const ENGINE_LOAD_DATA: u32 = 61;
+const ENGINE_DELETE: u32 = 62;
+
+const INFER_CALL: u32 = 70;
+const INFER_CALL_RET: u32 = 71;
+
 pub fn get_stat(_params: &mut RequestParams) -> Result<(), SvsmReqError> {
     #[allow(unused_imports)]
     use core::sync::atomic::Ordering;
@@ -99,6 +115,51 @@ fn create_channel(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     super::super::process_runtime::runtime::create_channel(params)
 }
 
+fn model_load_init(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::model_load_init(params)
+}
+
+fn model_load_data(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::model_load_data(params)
+}
+
+fn model_delete(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::model_delete(params)
+}
+
+fn lora_load_init(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::lora_load_init(params)
+}
+
+fn lora_load_data(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::lora_load_data(params)
+}
+
+fn lora_delete(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::lora_delete(params)
+}
+
+fn engine_load_init(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::engine_load_init(params)
+}
+
+fn engine_load_data(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::engine_load_data(params)
+}
+
+fn engine_delete(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::model_store::model::engine_delete(params)
+}
+
+fn infer_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::process_runtime::runtime::infer_call(params)
+}
+
+fn infer_call_ret(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    super::super::process_runtime::runtime::infer_call_ret(params)
+}
+
+
 pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<(), SvsmReqError> {
     breakdown_outb(254);
     //log::info!("{}, {}, {}, {}, {}",request,params.rcx, params.rdx, params.r8, params.r9);
@@ -116,6 +177,22 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
         CREATE_CHANNEL => create_channel(params),
         GET_STAT => get_stat(params),
         RESET_STAT => reset_stat(params),
+
+        MODEL_LOAD_INIT => model_load_init(params),
+        MODEL_LOAD_DATA => model_load_data(params),
+        MODEL_DELETE => model_delete(params),
+
+        LORA_LOAD_INIT => lora_load_init(params),
+        LORA_LOAD_DATA => lora_load_data(params),
+        LORA_DELETE => lora_delete(params),
+
+        ENGINE_LOAD_INIT => engine_load_init(params),
+        ENGINE_LOAD_DATA => engine_load_data(params),
+        ENGINE_DELETE => engine_delete(params),
+
+        INFER_CALL => infer_call(params),
+        INFER_CALL => infer_call_ret(params),
+
         _ => Err(SvsmReqError::unsupported_call()),
     };
     breakdown_outb(255);

@@ -13,6 +13,7 @@ mod utils;
 mod memory;
 mod locking;
 mod cpu;
+mod model_store;
 //pub use my_crypto_wrapper::get_keys;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RequestParams {

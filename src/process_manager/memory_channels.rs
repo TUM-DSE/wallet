@@ -5,6 +5,7 @@ use super::{allocation::AllocationRange, process::ProcessID, process_paging::Pro
 
 pub const INPUT_VADDR: u64 = 0x280_0000_0000u64;
 pub const OUTPUT_VADDR: u64 = 0x300_0000_0000u64;
+pub const INFERENCE_VADDR: u64 = 0x38000000000u64;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryChannel {
@@ -23,6 +24,10 @@ impl MemoryChannel {
 
     pub fn allocate_output(&mut self, page_table_ref: &mut ProcessPageTableRef, size: usize) {
         self.output = self.allocate_range(page_table_ref, size, OUTPUT_VADDR);
+    }
+
+    pub fn allocate_inference(&mut self, page_table_ref: &mut ProcessPageTableRef, size: usize) {
+        self.output = self.allocate_range(page_table_ref, size, INFERENCE_VADDR);
     }
 
     pub fn inflate_input(&mut self, page_table: u64, size: usize) {

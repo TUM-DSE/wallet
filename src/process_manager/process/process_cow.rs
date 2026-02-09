@@ -104,6 +104,7 @@ impl TrustedProcess {
             context,
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
+            infer_context: AllocationRange(0,0),
         }
     }
 
@@ -126,8 +127,20 @@ impl TrustedProcess {
             log::debug!("Adding trustlet function");
             let size = (4096 - (size & 0xFFF)) + size;
             trustlet.context.page_table_ref.add_function(function_code, size);
+            use crate::paddr_as_slice;
+            use crate::map_paddr;
+            use crate::vaddr_as_slice;
+            //let (_m, p) = paddr_as_slice!(trustlet.context.page_table_ref.process_page_table);
+            //p[7] = trustlet.infer_context.0;
+            //trustlet.infer_context.allocate_with_start_addr(trustlet.context.page_table_ref, page_count as u64, start);
             function_code_range.unmount();
             function_code_range.delete();
+
+            //trustlet.infer_context.allocate_inference(trustlet.context.page_table_ref,512);
+             use crate::process_manager::memory_channels::INFERENCE_VADDR;
+            trustlet.infer_context.allocate_with_start_addr(&mut trustlet.context.page_table_ref, 512, INFERENCE_VADDR);
+                //allocate_range(trustlet.context.page_table_ref, 512, INFERENCE_VADDR);
+
             breakdown_outb(207);
         }
         trustlet
