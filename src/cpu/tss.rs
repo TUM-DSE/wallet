@@ -4,6 +4,7 @@
 //
 // Author: Joerg Roedel <jroedel@suse.de>
 
+#![allow(dead_code)]
 use super::gdt::GDTEntry;
 use crate::address::VirtAddr;
 

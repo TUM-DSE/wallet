@@ -1,5 +1,4 @@
 use cpuarch::vmsa::VMSA;
-use ghcb::GHCBRef;
 pub mod gdt;
 pub mod ghcb;
 pub mod idt;

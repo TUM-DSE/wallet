@@ -4,6 +4,8 @@
 //
 // Author: Roy Hopkins <rhopkins@suse.de>
 
+#![allow(dead_code)]
+
 #[repr(C, packed)]
 #[derive(Default, Debug, Clone, Copy)]
 pub struct X86GeneralRegs {

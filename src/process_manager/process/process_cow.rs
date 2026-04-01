@@ -8,13 +8,10 @@ use crate::process_manager::process_memory;
 use crate::process_manager::PROCESS_STORE_SIZE;
 use crate::process_manager::process_memory::allocate_page;
 use crate::process_manager::process_paging::ProcessPageTableRef;
-use crate::process_runtime::runtime::{early_invoke, MmapManager};
-//use crate::protocols::errors::SvsmResultCode;
-use crate::SvsmResultCode;
-//use crate::protocols::errors::SvsmReqError;
-//use crate::protocols::RequestParams;
+use crate::process_runtime::runtime::early_invoke;
+use crate::process_runtime::process::mmap::MmapManager;
+use crate::MonitorError;
 use crate::RequestParams;
-use crate::SvsmReqError;
 use crate::sev::RMPFlags;
 use crate::sev::rmp_adjust;
 use crate::types::PageSize;
@@ -23,7 +20,6 @@ use crate::address::VirtAddr;
 use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::sev::utils::rmp_set_guest_vmsa;
 use crate::vaddr_as_u64_slice;
-use crate::paddr_as_u64_slice;
 use super::*;
 use cpuarch::vmsa::VMSA;
 use core::mem::replace;
@@ -104,6 +100,7 @@ impl TrustedProcess {
             context,
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
+            infer_context: AllocationRange(0,0),
         }
     }
 
@@ -126,15 +123,27 @@ impl TrustedProcess {
             log::debug!("Adding trustlet function");
             let size = (4096 - (size & 0xFFF)) + size;
             trustlet.context.page_table_ref.add_function(function_code, size);
+            
+            
+            
+            //let (_m, p) = paddr_as_slice!(trustlet.context.page_table_ref.process_page_table);
+            //p[7] = trustlet.infer_context.0;
+            //trustlet.infer_context.allocate_with_start_addr(trustlet.context.page_table_ref, page_count as u64, start);
             function_code_range.unmount();
             function_code_range.delete();
+
+            //trustlet.infer_context.allocate_inference(trustlet.context.page_table_ref,512);
+             use crate::process_manager::memory_channels::INFERENCE_VADDR;
+            trustlet.infer_context.allocate_with_start_addr(&mut trustlet.context.page_table_ref, 512, INFERENCE_VADDR);
+                //allocate_range(trustlet.context.page_table_ref, 512, INFERENCE_VADDR);
+
             breakdown_outb(207);
         }
         trustlet
     }
 }
 
-pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType) -> Result<(), SvsmReqError>{
+pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType) -> Result<(), MonitorError>{
 
     let size = params.rcx;
     let process_addr = params.rdx;
@@ -201,7 +210,7 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
     }
 }
 
-pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorError> {
     let process_id = ProcessID(params.rcx as usize);
     let process = PROCESS_STORE.get(process_id);
 
@@ -213,7 +222,7 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), SvsmReqE
             let process = PROCESS_STORE.get(ProcessID(i as usize));
             if process.process_type == TrustedProcessType::Trustlet {
                 if process.parent_id as usize == process_id.0 {
-                    return Err(SvsmReqError::RequestError(SvsmResultCode::INVALID_PARAMETER));
+                    return Err(MonitorError::invalid_params());
                 }
             }
         }

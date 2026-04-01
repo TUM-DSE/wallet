@@ -8,8 +8,6 @@ use crate::sev::utils::SevSnpError;
 extern "Rust" {
     fn wallet_memory_drop_guard(b: Box<dyn Any>);
     fn wallet_memory_map_4k(p: PhysAddr) -> (Box<dyn Any>, VirtAddr);
-
-    fn wallet_phys_to_virt(paddr: PhysAddr) -> VirtAddr;
 }
 
 
@@ -35,6 +33,7 @@ impl PerCPUPageMappingGuard {
             }
         }
     }
+
     pub fn virt_addr(&self) -> VirtAddr {
         self.vaddr
     }
@@ -48,6 +47,3 @@ impl Drop for PerCPUPageMappingGuard {
     }
 }
 
-pub fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
-    unsafe { wallet_phys_to_virt(paddr) }
-}

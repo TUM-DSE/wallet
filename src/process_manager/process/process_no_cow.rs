@@ -7,7 +7,7 @@ use crate::process_manager::process_memory::allocate_page;
 use crate::process_manager::process_paging::ProcessPageTableRef;
 use crate::process_runtime::runtime::MmapManager;
 use crate::protocols::errors::SvsmResultCode;
-use crate::protocols::errors::SvsmReqError;
+use crate::protocols::errors::MonitorError;
 use crate::protocols::RequestParams;
 use crate::sev::RMPFlags;
 use crate::sev::rmp_adjust;
@@ -121,7 +121,7 @@ impl TrustedProcess {
 }
 
 
-pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType) -> Result<(), SvsmReqError>{
+pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType) -> Result<(), MonitorError>{
     let size = params.rcx;
     let process_addr = params.rdx;
     let guest_pgt = params.r8;
@@ -187,7 +187,7 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
     }
 }
 
-pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorError> {
     let process_id = ProcessID(params.rcx as usize);
     let process = PROCESS_STORE.get(process_id);
 
@@ -199,7 +199,7 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), SvsmReqE
             let process = PROCESS_STORE.get(ProcessID(i as usize));
             if process.process_type == TrustedProcessType::Trustlet {
                 if process.parent_id as usize == process_id.0 {
-                    return Err(SvsmReqError::RequestError(SvsmResultCode::INVALID_PARAMETER));
+                    return Err(MonitorError::invalid_params());
                 }
             }
         }

@@ -1,27 +1,13 @@
-use crate::cpu::tss::X86Tss;
-use crate::address::VirtAddr;
-use crate::types::{SVSM_CS, SVSM_DS, SVSM_TSS};
-use core::arch::asm;
+use crate::types::SVSM_TSS;
 use core::mem;
 
-#[repr(C, packed(2))]
-#[derive(Clone, Copy, Debug)]
-struct GDTDesc {
-    size: u16,
-    addr: VirtAddr,
-}
-
-
+#[allow(dead_code)]
 #[derive(Copy, Clone, Debug)]
 pub struct GDTEntry(u64);
 
 impl GDTEntry {
     pub const fn from_raw(entry: u64) -> Self {
         Self(entry)
-    }
-
-    pub fn to_raw(&self) -> u64 {
-        self.0
     }
 
     pub const fn null() -> Self {
@@ -76,40 +62,6 @@ impl GDT {
         (base, limit)
     }
 
-    fn descriptor(&self) -> GDTDesc {
-        GDTDesc {
-            size: (GDT_SIZE * 8) - 1,
-            addr: VirtAddr::from(self.entries.as_ptr()),
-        }
-    }
-
-    pub fn load(&self) {
-        let gdt_desc = self.descriptor();
-        unsafe {
-            asm!(r#" /* Load GDT */
-                 lgdt   (%rax)
-
-                 /* Reload data segments */
-                 movw   %cx, %ds
-                 movw   %cx, %es
-                 movw   %cx, %fs
-                 movw   %cx, %gs
-                 movw   %cx, %ss
-
-                 /* Reload code segment */
-                 pushq  %rdx
-                 leaq   1f(%rip), %rax
-                 pushq  %rax
-                 lretq
-            1:
-                 "#,
-                in("rax") &gdt_desc,
-                in("rdx") SVSM_CS,
-                in("rcx") SVSM_DS,
-                options(att_syntax));
-        }
-    }
-
     pub unsafe fn set_tss_entry(&mut self, desc0: GDTEntry, desc1: GDTEntry) {
         let idx = (SVSM_TSS / 8) as usize;
 
@@ -117,19 +69,5 @@ impl GDT {
 
         tss_entries.add(0).write_volatile(desc0);
         tss_entries.add(1).write_volatile(desc1);
-    }
-
-    unsafe fn clear_tss_entry(&mut self) {
-        self.set_tss_entry(GDTEntry::null(), GDTEntry::null());
-    }
-
-    pub fn load_tss(&mut self, tss: &X86Tss) {
-        let (desc0, desc1) = tss.to_gdt_entry();
-
-        unsafe {
-            self.set_tss_entry(desc0, desc1);
-            asm!("ltr %ax", in("ax") SVSM_TSS, options(att_syntax));
-            self.clear_tss_entry()
-        }
     }
 }

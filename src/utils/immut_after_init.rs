@@ -20,6 +20,7 @@ pub type ImmutAfterInitResult<T> = Result<T, ImmutAfterInitError>;
 #[cfg(debug_assertions)]
 static MULTI_THREADED: AtomicBool = AtomicBool::new(false);
 
+#[allow(dead_code)]
 #[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug)]
 pub enum ImmutAfterInitError {
@@ -79,6 +80,7 @@ pub struct ImmutAfterInitCell<T: Copy> {
     init: AtomicBool,
 }
 
+#[allow(dead_code)]
 impl<T: Copy> ImmutAfterInitCell<T> {
     /// Create an unitialized `ImmutAfterInitCell` instance. The value must get
     /// initialized by means of [`Self::init()`] before first usage.
@@ -235,6 +237,7 @@ unsafe impl<T: Copy + Send + Sync> Sync for ImmutAfterInitCell<T> {}
 /// }
 /// ```
 ///
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ImmutAfterInitRef<'a, T: Copy> {
     #[doc(hidden)]
@@ -243,6 +246,7 @@ pub struct ImmutAfterInitRef<'a, T: Copy> {
     _phantom: PhantomData<&'a &'a T>,
 }
 
+#[allow(dead_code)]
 impl<'a, T: Copy> ImmutAfterInitRef<'a, T> {
     /// Create an unitialized `ImmutAfterInitRef` instance. The reference itself
     /// must get initialized via either of [`Self::init_from_ref()`] or
@@ -291,6 +295,7 @@ impl<'a, T: Copy> ImmutAfterInitRef<'a, T> {
     }
 }
 
+#[allow(dead_code)]
 impl<'a, T: Copy> ImmutAfterInitRef<'a, T> {
     /// Initialize an uninitialized `ImmutAfterInitRef` instance to point to
     /// value wrapped in a [`ImmutAfterInitCell`].
@@ -323,6 +328,7 @@ impl<T: Copy> Deref for ImmutAfterInitRef<'_, T> {
 unsafe impl<T: Copy + Send> Send for ImmutAfterInitRef<'_, T> {}
 unsafe impl<T: Copy + Send + Sync> Sync for ImmutAfterInitRef<'_, T> {}
 
+#[allow(dead_code)]
 pub fn immut_after_init_set_multithreaded() {
     #[cfg(debug_assertions)]
     MULTI_THREADED.store(true, Ordering::Relaxed);

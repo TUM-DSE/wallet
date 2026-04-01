@@ -16,6 +16,7 @@ pub struct MemoryRegion<A> {
     end: A,
 }
 
+#[allow(dead_code)]
 impl<A> MemoryRegion<A>
 where
     A: Address,

@@ -1,5 +1,6 @@
 use memory_helper::set_ecryption_mask_address_size;
 use process_memory::additional_monitor_memory_init;
+use crate::crypto::{gen_keys, KeyPair};
 
 #[cfg(feature = "bench_mem")]
 use process_memory::bench_mem;
@@ -9,7 +10,7 @@ use process_memory::preallocate_memory;
 
 pub use process::PROCESS_STORE;
 
-use crate::utils::immut_after_init::ImmutAfterInitCell;
+use crate::{model_store::{LORA_STORE, MODEL_STORE, ENGINE_STORE}, utils::immut_after_init::ImmutAfterInitCell};
 
 pub mod call_handler;
 pub mod process;
@@ -33,10 +34,13 @@ pub fn monitor_init(){
     set_ecryption_mask_address_size();
     let _ = additional_monitor_memory_init();
     PROCESS_STORE.init(PROCESS_STORE_SIZE);
+    MODEL_STORE.init(10);
+    LORA_STORE.init(10);
+    ENGINE_STORE.init(10);
     let _ = MONITOR_INIT_STATE.reinit(&MONITOR_INIT_STATE_TRUE);
 
-    #[cfg(feature = "bench_mem")]
-    bench_mem();
+    let encryption_keys: KeyPair = unsafe{*gen_keys()};
+    log::info!("Monitor generated keys: private key {:?}, public key {:?}", encryption_keys.private_key, encryption_keys.public_key);
 
     #[cfg(feature = "prealloc")]
     preallocate_memory();

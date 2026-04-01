@@ -1,24 +1,14 @@
 use crate::address::PhysAddr;
 pub const REPORT_RESPONSE_SIZE: usize = size_of::<SnpReportResponse>();
 use crate::interop::report::{SnpReportResponse, AttestationReport};
-//use crate::greq::pld_report::{SnpReportResponse, AttestationReport};
-//use crate::protocols::errors::SvsmReqError;
-//use crate::protocols::RequestParams;
-use crate::RequestParams;
-use crate::SvsmReqError;
-//use crate::mm::PerCPUPageMappingGuard;
+use crate::{MonitorError, RequestParams};
 use crate::memory::paging::PerCPUPageMappingGuard;
-use core::slice;
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::vaddr_as_u64_slice;
 
 #[allow(unused_imports)]
-use crate::my_crypto_wrapper::my_SHA512;
-use crate::my_crypto_wrapper::my_Hacl_Ed25519_sign;
-use crate::my_crypto_wrapper::get_keys;
-use crate::my_crypto_wrapper::decrypt;
-use crate::my_crypto_wrapper::key_pair;
+use crate::crypto::{my_SHA512, my_Hacl_Ed25519_sign, get_keys, decrypt, KeyPair};
 
 use crate::process_manager::PROCESS_STORE;
 use crate::process_manager::process::ProcessID;
@@ -52,6 +42,7 @@ fn store_snp_report(report_data: &[u8], report_size: usize) {
   }
 }
 
+#[allow(static_mut_refs)]
 fn get_snp_report() -> Option<(&'static [u8], usize)> {
   unsafe {
       SNP_REPORT_STORE.as_ref().map(|report| (&report.data[..], report.size))
@@ -98,28 +89,81 @@ impl Default for ProcessMeasurements {
     }
 }
 
+#[cfg(feature = "rustcrypto")]
+#[cfg(not(feature = "boottime"))]
+pub fn measure(start_address: u64, size: u64) -> [u8; HASH_SIZE] {
+  let region = unsafe {
+    core::slice::from_raw_parts(start_address as *const u8, size as usize)
+  };
+  let hash = Sha512::digest(region);
+  let res: [u8; HASH_SIZE] = [0; 64];
+  (&mut res).copy_from_slice(&hash);
+  return res;
+}
+
+
+#[cfg(not(feature = "rustcrypto"))]
 #[cfg(not(feature = "boottime"))]
 #[allow(non_snake_case)]
 pub fn measure(start_address: u64, size: u64) -> [u8; HASH_SIZE] {
 
-    // Unsafe part: ensure the memory region is accessible and valid
+  // Unsafe part: ensure the memory region is accessible and valid
+
+  use crate::crypto::{sha512_create, sha512_digest, sha512_update};
+
+  let mut hash: [u8; HASH_SIZE] = [0; HASH_SIZE];
+  if size < core::u32::MAX.into() {
     let region = unsafe {
-        core::slice::from_raw_parts(start_address as *const u8, size as usize)
+      core::slice::from_raw_parts(start_address as *const u8, size as usize)
     };
     log::debug!("[Measure] Region address {:p} and len { }", region, region.len());
 
-    let mut hash: [u8; HASH_SIZE] = [0; HASH_SIZE];
     // Get the hash using SHA-512 over the entire memory region
     unsafe {
-        my_SHA512(
-            region.as_ptr() as *mut u8,
-            region.len().try_into().unwrap(),
-            hash.as_mut_ptr(),
-        );
+      my_SHA512(
+        region.as_ptr() as *mut u8,
+        region.len().try_into().unwrap(),
+        hash.as_mut_ptr(),
+      );
     }
-    log::debug!("[Measure] resulting hash {:?}", hash);
+    log::debug!("[Measure] resulting hash(1) {:?}", hash);
     // Return the final hash measurement
-    hash
+  } else {
+
+    let mut offset = 0;
+    let mut size = size;
+
+    let state = unsafe {
+      sha512_create()
+    };
+
+    loop {
+      let chunck_size = if size >= core::u32::MAX.into() {
+        core::u32::MAX.into()
+      } else {
+        size
+      };
+      let region = unsafe {
+        core::slice::from_raw_parts((start_address + offset) as *const u8, chunck_size.try_into().unwrap())
+      };
+      offset += chunck_size;
+
+      unsafe {
+        sha512_update(region.as_ptr() as *mut u8, region.len().try_into().unwrap(), state)
+      };
+
+      if size > <u32 as Into<u64>>::into(core::u32::MAX) {
+        size -= <u32 as Into<u64>>::into(core::u32::MAX);
+      } else {
+        break
+      }
+    }
+    unsafe {
+      sha512_digest(hash.as_mut_ptr(), state)
+    };
+    log::debug!("[Measure] resulting hash(2) {:?}", hash);
+  }
+  hash
 }
 
 fn sign_report(report: &[u8]) -> [u8; SIGNATURE_SIZE] {
@@ -167,7 +211,7 @@ fn copy_back_report(report_buffer: u64, report_data: &[u8], report_size: usize) 
 }
 
 #[allow(non_snake_case)]
-fn monitor_report(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+fn monitor_report(params: &mut RequestParams) -> Result<(), MonitorError> {
     if let Some((stored_report, stored_report_size)) = get_snp_report() {
         // If the report exists, just return it
         log::debug!("Monitor has cached the SNP report");
@@ -223,7 +267,7 @@ fn monitor_report(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 }
 
 #[allow(non_snake_case)]
-fn zygote_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn zygote_report(params: &mut RequestParams) -> Result<(), MonitorError>{
     let zygote_id = ProcessID(params.r8 as usize);
     let zygote = PROCESS_STORE.get(zygote_id);
 
@@ -261,7 +305,7 @@ fn zygote_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 }
 
 #[allow(non_snake_case)]
-fn trustlet_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn trustlet_report(params: &mut RequestParams) -> Result<(), MonitorError>{
     let trustlet_id = ProcessID(params.r8 as usize);
     let trustlet = PROCESS_STORE.get(trustlet_id);
 
@@ -300,7 +344,7 @@ fn trustlet_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 }
 
 #[allow(non_snake_case)]
-fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn function_report(params: &mut RequestParams) -> Result<(), MonitorError>{
     let guest_pgt = params.r8;
     let size = PAGE_SIZE;
     let function_data_addr = params.r9;
@@ -375,7 +419,7 @@ fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 }
 
 #[allow(non_snake_case)]
-pub fn diff_attestation(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+pub fn diff_attestation(params: &mut RequestParams) -> Result<(), MonitorError>{
     match params.rdx {
         MONITOR_ATTESTATION => {
             log::debug!("[Performing monitor attestation]");
@@ -423,11 +467,11 @@ pub fn diff_attestation(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 }
 
 #[allow(non_snake_case)]
-pub fn get_public_key(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+pub fn get_public_key(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     //log::info!("[Monitor] Getting public key");
 
-    let encryption_keys: key_pair = unsafe{*get_keys()};
+    let encryption_keys: KeyPair = unsafe{*get_keys()};
 
     let target_address = PhysAddr::from(params.rcx);
     let mapped_target_page = PerCPUPageMappingGuard::create_4k(target_address).unwrap();
@@ -443,46 +487,8 @@ pub fn get_public_key(params: &mut RequestParams) -> Result<(), SvsmReqError> {
   Ok(())  
 }
 
-pub fn exec_elf(params: &mut RequestParams) -> Result<(), SvsmReqError> {
-    // TODO: Get the PA of the 2 pages, copy contents 2 contiguous array.
-    // Use the ELF read functions on the array and inspect the results
-    // See how to execute the ELF. Modify a register and read it from monitor to verify program
-    // execution
-    // Create a nicer API for transfering ELF files to monitor.
-    log::info!("Monitor received elf");
-    let page1_address = PhysAddr::from(params.r8);
-    let page1 = PerCPUPageMappingGuard::create_4k(page1_address).unwrap();
-    let page1_data = unsafe {page1.virt_addr().as_mut_ptr::<[u8;PAGE_SIZE]>().as_mut().unwrap()};
-
-    let page2_address = PhysAddr::from(params.rcx);
-    let page2 = PerCPUPageMappingGuard::create_4k(page2_address).unwrap();
-    let page2_data = unsafe {page2.virt_addr().as_mut_ptr::<[u8;PAGE_SIZE]>().as_mut().unwrap()};
-
-    let elf_size : u32 = params.rdx.try_into().unwrap();
-
-    log::info!("[Monitor] Elf size: {}", elf_size);
-
-    //copy elf in contiguous array
-    let mut elf_raw_data : [u8; PAGE_SIZE * 2] = [0; PAGE_SIZE * 2];
-
-    let mut i = 0;
-    while i < PAGE_SIZE {
-        elf_raw_data[i] = page1_data[i];
-        elf_raw_data[i + PAGE_SIZE] = page2_data[i];
-        i = i + 1;
-    }
-
-    let elf_buf = unsafe { slice::from_raw_parts(elf_raw_data.as_ptr(), elf_size.try_into().unwrap()) };
-    let elf = match elf::Elf64File::read(elf_buf) {
-        Ok(elf) => elf,
-        Err(e) => panic!("error reading ELF: {}", e),
-    };
-    log::info!("Elf file: {:?}", elf);
-    Ok(())
-}
-
 // TODO: For now monitor just receives the policy here and decrypts it. Probablly want to do more with it!
-pub fn send_policy(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+pub fn send_policy(params: &mut RequestParams) -> Result<(), MonitorError> {
     log::info!("[Monitor] Receiveing policy");
     let encrypted_data_address = PhysAddr::from(params.r8);
     let mapped_enc_data_page = PerCPUPageMappingGuard::create_4k(encrypted_data_address).unwrap();
@@ -504,7 +510,7 @@ pub fn send_policy(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 
 /* helper report generation options for attestation microbenchmarks */
 #[allow(non_snake_case)]
-fn monitor_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+fn monitor_report_cold(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     // The report does not exist so, retrieve and store the Original SNP report
     log::debug!("Monitor retrieves the SNP report");
@@ -552,7 +558,7 @@ fn monitor_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 }
 
 #[allow(non_snake_case)]
-fn prepare_zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn prepare_zygote_report_cold(params: &mut RequestParams) -> Result<(), MonitorError>{
     let zygote_id = ProcessID(params.r8 as usize);
     let zygote = PROCESS_STORE.get(zygote_id);
 
@@ -594,7 +600,7 @@ fn prepare_zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqE
 }
 
 #[allow(non_snake_case)]
-fn zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn zygote_report_cold(params: &mut RequestParams) -> Result<(), MonitorError>{
     let zygote_id = ProcessID(params.r8 as usize);
     let zygote = PROCESS_STORE.get(zygote_id);
 
@@ -641,7 +647,7 @@ fn zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 }
 
 #[allow(non_snake_case)]
-fn prepare_trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn prepare_trustlet_report_cold(params: &mut RequestParams) -> Result<(), MonitorError>{
     let trustlet_id = ProcessID(params.r8 as usize);
     let trustlet = PROCESS_STORE.get(trustlet_id);
 
@@ -666,7 +672,7 @@ fn prepare_trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmRe
 }
 
 #[allow(non_snake_case)]
-fn trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn trustlet_report_cold(params: &mut RequestParams) -> Result<(), MonitorError>{
     let trustlet_id = ProcessID(params.r8 as usize);
     let trustlet = PROCESS_STORE.get(trustlet_id);
 

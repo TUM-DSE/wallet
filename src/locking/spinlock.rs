@@ -98,6 +98,7 @@ pub struct SpinLock<T> {
 unsafe impl<T: Send> Send for SpinLock<T> {}
 unsafe impl<T: Send> Sync for SpinLock<T> {}
 
+#[allow(dead_code)]
 impl<T> SpinLock<T> {
     /// Creates a new SpinLock instance with the specified initial data.
     ///

@@ -8,7 +8,7 @@ use cpuarch::vmsa::VMSA;
 use core::cell::UnsafeCell;
 use crate::process_manager::allocation::AllocationRange;
 use alloc::vec::Vec;
-use crate::process_runtime::runtime::MmapManager;
+use crate::process_runtime::process::mmap::MmapManager;
 use crate::process_manager::exception_handling::gdt_trustlet;
 use crate::process_manager::process_memory::free_page;
 use crate::process_manager::exception_handling::tss_trustlet;
@@ -68,9 +68,6 @@ pub enum TrustedProcessType {
     Zygote,
     Trustlet,
 }
-pub const UNDEFINED_PROCESS: u32 = 0;
-pub const ZYGOTE_PROCESS: u32 = 1;
-pub const TRUSTLET_PROCESS: u32 = 2;
 
 pub static PROCESS_STORE: TrustedProcessStore = TrustedProcessStore::new();
 
@@ -122,18 +119,6 @@ impl TrustedProcessStore {
     }
 }
 
-#[derive(Clone,Copy,Debug)]
-pub struct ProcessData(PhysAddr);
-
-impl ProcessData {
-    pub fn dublicate_read_only(&self) -> ProcessData{
-        ProcessData(self.0)
-    }
-    pub fn append_data(&self){
-
-    }
-}
-
 #[derive(Clone,Copy,Debug, Default)]
 pub struct ProcessID(pub usize);
 
@@ -172,6 +157,7 @@ pub struct TrustedProcess {
     pub context: ProcessContext,
     pub mmap_manager: MmapManager,
     pub pf_target_vaddr: u64,
+    pub infer_context: AllocationRange,
 }
 
 impl ProcessBaseContext {
@@ -221,6 +207,9 @@ impl TrustedProcess {
         let measurements: ProcessMeasurements = process.measurements;
         let mut context = ProcessContext::default();
         context.init(base, measurements, process.context);
+        let inf = AllocationRange(0,0);
+        //inf.allocate_trustlet(512);
+        //inf.allocate_inference(512);
 
         TrustedProcess {
             process_type: TrustedProcessType::Trustlet,
@@ -231,6 +220,7 @@ impl TrustedProcess {
             context,
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
+            infer_context: inf,
         }
 
     }
@@ -271,6 +261,7 @@ impl TrustedProcess {
             context: ProcessContext::default(),
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
+            infer_context: AllocationRange(0,0),
         }
     }
 }

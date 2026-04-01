@@ -124,6 +124,7 @@ fn compose_val(readers: u64, writers: u64) -> u64 {
 /// A reader-writer lock that allows multiple readers or a single writer
 /// to access the protected data. [`RWLock`] provides exclusive access for
 /// writers and shared access for readers, for efficient synchronization.
+#[allow(dead_code)]
 impl<T> RWLock<T> {
     /// Creates a new [`RWLock`] instance with the provided initial data.
     ///

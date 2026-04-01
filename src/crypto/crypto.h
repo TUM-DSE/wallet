@@ -1,5 +1,5 @@
-#ifndef __INCLUDE_MY_CRYPTO_H
-#define __INCLUDE_MY_CRYPTO_H
+#ifndef __INCLUDE_CRYPTO_H
+#define __INCLUDE_CRYPTO_H
 
 #include <stdint.h>
 #include <stdbool.h>

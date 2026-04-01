@@ -25,6 +25,7 @@ const fn sign_extend(addr: InnerAddr) -> InnerAddr {
     }
 }
 
+#[allow(dead_code)]
 pub trait Address:
     Copy + From<InnerAddr> + Into<InnerAddr> + PartialEq + Eq + PartialOrd + Ord
 {

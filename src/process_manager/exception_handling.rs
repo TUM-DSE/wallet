@@ -50,6 +50,7 @@ pub fn tss_trustlet() -> ReadLockGuard<'static, X86Tss> {
     TSS_TRUSTLET.lock_read()
 }
 
+#[allow(dead_code)]
 pub fn tss_trustlet_mut() -> WriteLockGuard<'static, X86Tss> {
     TSS_TRUSTLET.lock_write()
 }

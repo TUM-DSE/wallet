@@ -32,16 +32,3 @@ pub fn read_cr3() -> PhysAddr{
     }
     PhysAddr::from(ret)
 }
-
-pub fn rdtsc() -> u64 {
-    let eax: u32;
-    let edx: u32;
-
-    unsafe {
-        asm!("rdtsc",
-             out("eax") eax,
-             out("edx") edx,
-             options(att_syntax, nomem, nostack));
-    }
-    (eax as u64) | (edx as u64) << 32
-}

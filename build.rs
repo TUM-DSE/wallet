@@ -4,8 +4,6 @@
 //
 // Author: Claudio Carvalho <cclaudio@linux.ibm.com>
 
-use std::env::current_dir;
-use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 
@@ -15,7 +13,7 @@ fn main() {
     println!("Writting to {out_dir}");
     // Build crypto.
     let status = Command::new("./build.sh")
-        .current_dir("src/my_crypto")
+        .current_dir("src/crypto")
         .env("NIX_ENFORCE_NO_NATIVE", "0")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -30,7 +28,7 @@ fn main() {
     assert!(status.success());
 
     let status= Command::new("cp")
-        .args(["src/my_crypto/libmy_crypto.a", &out_dir])
+        .args(["src/crypto/libhaclcrypto.a", &out_dir])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
@@ -41,5 +39,5 @@ fn main() {
     //println!("cargo:rustc-link-search=src/my_crypto/");
     //println!("cargo:rustc-link-lib=my_crypto");
     println!("cargo:rustc-link-search={}",out_dir);
-    println!("cargo:rustc-link-lib=my_crypto");
+    println!("cargo:rustc-link-lib=haclcrypto");
 }

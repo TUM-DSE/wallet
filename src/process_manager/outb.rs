@@ -28,3 +28,12 @@ pub fn breakdown_outb(_value: u64) {
 pub fn breakdown_outb(value: u64) {
     outb(value);
 }
+
+#[inline(always)]
+pub fn capture(value: u64) {
+    unsafe {
+        asm!(
+            "outb 0xF4",
+            in("rax") value)
+    };
+}

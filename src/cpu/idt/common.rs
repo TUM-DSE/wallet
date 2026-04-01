@@ -4,6 +4,8 @@
 //
 // Author: Joerg Roedel <jroedel@suse.de>
 
+#![allow(dead_code)]
+
 use crate::address::{Address, VirtAddr};
 use crate::cpu::registers::{X86GeneralRegs, X86InterruptFrame};
 use crate::locking::{RWLock, ReadLockGuard, WriteLockGuard};

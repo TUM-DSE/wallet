@@ -1,8 +1,9 @@
-#include "my_crypto.h"
+#include "crypto.h"
 #include "hacl/include/Hacl_Curve25519_51.h" 
 #include "hacl/include/Hacl_Ed25519.h"
 #include "hacl/include/Hacl_NaCl.h"
 #include "hacl/include/Hacl_Hash_SHA3.h"
+#include "hacl/include/Hacl_Hash_SHA2.h"
 #include <stdint.h>
 
 key_pair monitor_keys;
@@ -63,8 +64,24 @@ uint32_t decrypt(
 
 void my_SHA512(uint8_t* buff, const unsigned int buff_len, uint8_t* hash)
 {
-	Hacl_Hash_SHA3_sha3_512(hash, buff, buff_len);
+	//Hacl_Hash_SHA3_sha3_512(hash, buff, buff_len);
+	Hacl_Hash_SHA2_hash_512(hash, buff, buff_len);
 }
+
+void* sha512_create() {
+    Hacl_Hash_SHA2_state_t_512* state = Hacl_Hash_SHA2_malloc_512();
+    return state;
+}
+
+void sha512_update(uint8_t* buff, uint32_t msg_len, Hacl_Hash_SHA2_state_t_512* state) {
+    Hacl_Hash_SHA2_update_512(state, buff, msg_len);
+}
+
+void sha512_digest(uint8_t* hash, Hacl_Hash_SHA2_state_t_512* state) {
+    Hacl_Hash_SHA2_digest_512(state,hash);
+    Hacl_Hash_SHA2_free_512(state);
+}
+
 
 void my_Hacl_Ed25519_sign(uint8_t *msg, uint32_t msg_len, uint8_t *private_key, uint8_t *signature)
 {

@@ -1,17 +1,21 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright (C) 2023 IBM
+//
+// Author: Claudio Carvalho <cclaudio@linux.ibm.com>
 
-use crate::SvsmReqError;
+use crate::MonitorError;
 extern "Rust" {
-    fn wallet_get_regular_report(buffer: &mut [u8]) -> Result<usize, SvsmReqError>;
+    fn wallet_get_regular_report(buffer: &mut [u8]) -> usize;
 }
 
-pub fn get_regular_report(buffer: &mut [u8]) -> Result<usize, SvsmReqError> {
-    unsafe { wallet_get_regular_report(buffer) }
+pub fn get_regular_report(buffer: &mut [u8]) -> Result<usize, MonitorError> {
+    let size = unsafe { wallet_get_regular_report(buffer) };
+    match size {
+        0 => Err(MonitorError::report_failed()),
+        _ => Ok(size)
+    }
 }
-
-
-
-
-pub const USER_DATA_SIZE: usize = 64;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug)]
@@ -27,16 +31,6 @@ struct TcbVersion {
     raw: u64,
 }
 
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
-pub struct SnpReportRequest {
-    user_data: [u8; USER_DATA_SIZE],
-    vmpl: u32,
-    flags: u32,
-    rsvd: [u8; 24],
-}
-
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug)]
 pub struct SnpReportResponse {
@@ -46,6 +40,8 @@ pub struct SnpReportResponse {
     report: AttestationReport,
 }
 
+
+#[allow(dead_code)]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
 pub enum SnpReportResponseStatus {
@@ -55,27 +51,14 @@ pub enum SnpReportResponseStatus {
 }
 
 impl SnpReportResponse {
-    pub fn try_from_as_ref(buffer: &[u8]) -> Result<&Self, SvsmReqError> {
-        let buffer = buffer
-            .get(..size_of::<Self>())
-            .ok_or_else(SvsmReqError::invalid_parameter)?;
-
-        // SAFETY: SnpReportResponse has no invalid representations, as it is
-        // comprised entirely of integer types. It is repr(packed), so its
-        // required alignment is simply 1. We have checked the size, so this
-        // is entirely safe.
-        let response = unsafe { &*buffer.as_ptr().cast::<Self>() };
-        Ok(response)
-    }
-
     /// Validate the [SnpReportResponse] fields
-    pub fn validate(&self) -> Result<(), SvsmReqError> {
+    pub fn validate(&self) -> Result<(), MonitorError> {
         if self.status != SnpReportResponseStatus::Success as u32 {
-            return Err(SvsmReqError::invalid_request());
+            return Err(MonitorError::report_invalid());
         }
 
         if self.report_size != size_of::<AttestationReport>() as u32 {
-            return Err(SvsmReqError::invalid_format());
+            return Err(MonitorError::report_format_invalid());
         }
 
         Ok(())
@@ -89,11 +72,6 @@ impl SnpReportResponse {
           self.report_size
     }
 }
-
-
-
-
-
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug)]

@@ -69,6 +69,7 @@ bitflags! {
     }
 }
 
+#[allow(dead_code)]
 impl ProcessPageFlags {
     pub fn exec() -> Self {
         Self::PRESENT | Self::GLOBAL | Self::ACCESSED |
@@ -162,10 +163,6 @@ impl ProcessPageTable {
     pub fn index_arg(i: usize, addr: VirtAddr) -> usize {
         addr.bits() >> (12 + i * 9) & 0x1ff
     }
-
-    pub fn init(&mut self){
-        self.0 = Default::default();
-    }
 }
 
 #[repr(C)]
@@ -208,14 +205,6 @@ macro_rules! check_replace_cow_table {
 
 impl ProcessPageTableRef {
 
-    pub fn init(&mut self) {
-        self.process_page_table = allocate_page();
-        let (_mapping, table) = paddr_as_u64_slice!(self.process_page_table);
-        for i in 0..512 {
-            table[i] = 0;
-        }
-    }
-
     pub fn init_vmpl1(&mut self){
         self.process_page_table = allocate_page();
         let (mapping, table) = paddr_as_u64_slice!(self.process_page_table);
@@ -227,33 +216,6 @@ impl ProcessPageTableRef {
 
     pub fn set_external_table(&mut self, pgd_addr: u64) {
         self.process_page_table = PhysAddr::from(pgd_addr);
-    }
-
-    pub fn print_table(&self) {
-        self.print_table_helper(self.process_page_table, PGD);
-    }
-
-    fn print_table_helper(&self, paddr: PhysAddr, level: usize) {
-        let (_mapping, table) = paddr_as_table!(paddr);
-        let dist = "    ".repeat(PGD-level);
-        for i in 0..512 {
-            let page: ProcessPageTableEntry = table[i];
-            if usize::from(page.0) != 0 {
-                log::info!("{}Entry: Index {}, Address: {:#x}, Flags {:#b}",dist, i, page.0, usize::from(page.0) & 0x1FF);
-                //We might get 4MB pages when taking in tables from the guest
-                if level == PMD {
-                    if usize::from(page.0) & 0x80 != 0 {
-                        //Found hugh page
-                        return;
-                    }
-                }
-                if level > PTE {
-                    let addr = PhysAddr::from(usize::from(strip_c_bit(page.0)) & !0x1FF );
-                    self.print_table_helper(addr, level-1);
-                }
-            } 
-        }
-
     }
 
     fn add_region_vaddr(&self, vaddr: VirtAddr, data: &[u8]) {
@@ -631,33 +593,12 @@ impl ProcessPageTableRef {
 
         let copy_page_count = size / PAGE_SIZE_4K;
         for i in 0..copy_page_count {
-            // Mapping the src, dst to as u64;512 slices
             let origin_phys = self.get_page(origin + 4096usize * (i as usize));
             let (_mapping,origin_slice) = paddr_as_slice!(origin_phys);
-            //use crate::process_manager::memory_helper::ZERO_PAGE;
-            //et origin_slice = unsafe { &*(&ZERO_PAGE as *const [u64;512] as *const [u64;512]) };;
             let target_vaddr = target + 4096usize * (i as usize);
             let target_slice = vaddr_as_slice!(target_vaddr);
 
-
-
-            //log::debug!("Origin: {:x?}/{:x?}, target: {:x?}/{:x?}",
-            //origin_phys, _mapping.virt_addr(), target_vaddr, super::process_memory::ProcessMemConfig::virt_to_phys(target_vaddr));
-            //log::debug!("Origin: {:x?}/{:x?}, target: {:x?}",origin_phys, _mapping.virt_addr(), target_vaddr);
-
-            let cr3 = crate::interop::memory::read_cr3();
-            let (_m1, pt) = paddr_as_u64_slice!(cr3);
-            let (_m2, pt2) = paddr_as_u64_slice!(strip_paddr!(pt[6].into()));
-            let (_m3, pt3) = paddr_as_u64_slice!(strip_paddr!(pt2[0].into()));
-            let (_m4, pt4) = paddr_as_u64_slice!(strip_paddr!(pt3[0].into()));
-            //log::debug!("Target: {:x?}", pt4);
-            //log::debug!("0: {:x?}\n1: {:x?}\n2: {:x?}\n3:{:x?}", pt, pt2, pt3, pt4);
-            //let a = origin_slice[0];
-
-            // Copying the src to dst
-            //log::debug!("AHHHH");
             _ = replace(target_slice, *origin_slice);
-            //log::debug!("AHHHH2");
         }
     }
 
@@ -737,19 +678,6 @@ impl ProcessPageTableRef {
             }
         }
         return ProcessTableLevelMapping::PTE(prev_addr, index);
-    }
-
-    pub fn page_walk_external(&self, vaddr: VirtAddr) -> PhysAddr {
-        let (_pgd_mapping, pgd_table) = paddr_as_table!(self.process_page_table);
-        //let mut current_mapping = self.page_walk(&pgd_table, self.process_page_table, vaddr);
-        let current_mapping = self.page_walk(&pgd_table, self.process_page_table, vaddr);
-        match current_mapping {
-            ProcessTableLevelMapping::PTE(addr, index) => {
-                let (_mapping, table) = paddr_as_u64_slice!(addr);
-                return PhysAddr::from(table[index]);
-            }
-            _ => return PhysAddr::null()
-        }
     }
 
     pub fn virt_to_phys(&self, vaddr: VirtAddr) -> PhysAddr {
@@ -990,6 +918,7 @@ impl ProcessPageTableRef {
         }
     }
 
+
     fn _copy_page_table(&self, src: PhysAddr, dst: PhysAddr, level: u64) {
         // Copy the page table and its memory recursively
 
@@ -1050,12 +979,87 @@ impl ProcessPageTableRef {
             }
         }
     }
+    pub fn map_region(&self, target: VirtAddr, pages: u64, flags: ProcessPageFlags) {
+        use crate::process_manager::outb::capture;
+        let (_pgd_mapping, pgd_table) = paddr_as_table!(self.process_page_table);
+        capture(210);
+        let mut lvl3_idx: usize = ProcessPageTable::index::<PGD>(target);
+        let mut lvl2_idx: usize = ProcessPageTable::index::<PUD>(target);
+        let mut lvl1_idx: usize = ProcessPageTable::index::<PMD>(target);
+        let mut lvl0_idx: usize = ProcessPageTable::index::<PTE>(target);
 
-    pub fn copy_from(&mut self, other: &ProcessPageTableRef) {
-        // Copy the page table and its memory from the other ProcessPageTableRef
-        assert!(self.process_page_table != PhysAddr::null());
-        assert!(other.process_page_table != PhysAddr::null());
-        self._copy_page_table(other.process_page_table, self.process_page_table, 4);
+        let mut remaining_pages = pages;
+
+        let page_table_flags = ProcessPageFlags::PRESENT | ProcessPageFlags::WRITABLE |
+                               ProcessPageFlags::USER_ACCESSIBLE | ProcessPageFlags::ACCESSED;
+
+        if pages == 0 {
+            return;
+        }
+
+        #[allow(unused_labels)]
+        'pgd: loop {
+            if !pgd_table[lvl3_idx].flags().contains(ProcessPageFlags::PRESENT) {
+                let new_page = allocate_page();
+                let (_new_mapping, _new_data) = paddr_as_table!(new_page);
+                rmp_adjust(_new_mapping.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
+                pgd_table[lvl3_idx].set(new_page, page_table_flags);
+            }
+
+            'pud: loop {
+                let (_pud_mapping, pud_table) = paddr_as_table!(strip_paddr!(PhysAddr::from(pgd_table[lvl3_idx].0.bits())));
+                if !pud_table[lvl2_idx].flags().contains(ProcessPageFlags::PRESENT) {
+                    let new_page = allocate_page();
+                    let (_new_mapping, _new_data) = paddr_as_table!(new_page);
+                    rmp_adjust(_new_mapping.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
+                    pud_table[lvl2_idx].set(new_page, page_table_flags);
+                }
+                'pmd: loop {
+                    let (_pmd_mapping, pmd_table) = paddr_as_table!(strip_paddr!(PhysAddr::from(pud_table[lvl2_idx].0.bits())));
+                    if !pmd_table[lvl1_idx].flags().contains(ProcessPageFlags::PRESENT) {
+                        let new_page = allocate_page();
+                        let (_new_mapping, _new_data) = paddr_as_table!(new_page);
+                        rmp_adjust(_new_mapping.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
+                        pmd_table[lvl1_idx].set(new_page, page_table_flags);
+                    }
+                    let (_pte_mapping, pte_table) = paddr_as_table!(strip_paddr!(PhysAddr::from(pmd_table[lvl1_idx].0.bits())));
+
+                    'pte: loop {
+                        if remaining_pages == 0 {
+                            break 'pgd;
+                        }
+                        if lvl0_idx == 512 {
+                            lvl0_idx = 0;
+                            lvl1_idx += 1;
+                            if lvl1_idx == 512 {
+                                lvl1_idx = 0;
+                                lvl2_idx += 1;
+                                if lvl2_idx == 512 {
+                                    lvl2_idx = 0;
+                                    lvl3_idx += 1;
+                                    if lvl3_idx == 512 {
+                                        panic!("Memory cannot be mapped");
+                                    }
+                                    break 'pud
+                                }
+                                break 'pmd;
+                            }
+                            break 'pte;
+                        }
+
+                        if !pte_table[lvl0_idx].flags().contains(ProcessPageFlags::PRESENT) {
+                            let new_page = allocate_page();
+                            let (_new_mapping, _new_data) = paddr_as_table!(new_page);
+                            rmp_adjust(_new_mapping.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
+                            pte_table[lvl0_idx].set(new_page, flags);
+                        }
+                        lvl0_idx += 1;
+                        remaining_pages -= 1;
+                    }
+                }
+            }
+        }
+        capture(211);
     }
 
     pub fn copy_pgd(&mut self, other: &ProcessPageTableRef) {

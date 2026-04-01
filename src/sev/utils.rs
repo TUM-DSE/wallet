@@ -6,12 +6,11 @@
 
 use crate::address::{Address, VirtAddr};
 //use crate::error::SvsmError;
-use crate::types::{PageSize, GUEST_VMPL, PAGE_SIZE, PAGE_SIZE_2M};
-use crate::utils::MemoryRegion;
+use crate::types::{PageSize, GUEST_VMPL};
 use core::arch::asm;
 use core::fmt;
-use crate::SvsmReqError;
 
+#[allow(dead_code)]
 pub mod stat {
     use core::sync::atomic::AtomicU64;
     pub static PVALIDATE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -41,29 +40,6 @@ impl From<SevSnpError> for SvsmError {
     }
 }
 
-impl From<SvsmError> for SvsmReqError {
-    fn from(err: SvsmError) -> Self {
-        match err {
-            // SEV-SNP errors obtained from PVALIDATE or RMPADJUST are returned
-            // to the guest as protocol-specific errors.
-            SvsmError::SevSnp(e) => Self::protocol(e.ret()),
-            // Use a fatal error for now
-        }
-    }
-}
-
-impl SevSnpError {
-    // This should get optimized away by the compiler to a single instruction
-    pub fn ret(&self) -> u64 {
-        match self {
-            Self::FAIL_INPUT(ret)
-            | Self::FAIL_UNCHANGED(ret)
-            | Self::FAIL_PERMISSION(ret)
-            | Self::FAIL_SIZEMISMATCH(ret) => *ret,
-        }
-    }
-}
-
 impl fmt::Display for SevSnpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -75,45 +51,11 @@ impl fmt::Display for SevSnpError {
     }
 }
 
-fn pvalidate_range_4k(region: MemoryRegion<VirtAddr>, valid: PvalidateOp) -> Result<(), SvsmError> {
-    for addr in region.iter_pages(PageSize::Regular) {
-        pvalidate(addr, PageSize::Regular, valid)?;
-    }
-
-    Ok(())
-}
-
-pub fn pvalidate_range(
-    region: MemoryRegion<VirtAddr>,
-    valid: PvalidateOp,
-) -> Result<(), SvsmError> {
-    let mut addr = region.start();
-    let end = region.end();
-
-    while addr < end {
-        if addr.is_aligned(PAGE_SIZE_2M) && addr + PAGE_SIZE_2M <= end {
-            // Try to validate as a huge page.
-            // If we fail, try to fall back to regular-sized pages.
-            pvalidate(addr, PageSize::Huge, valid).or_else(|err| match err {
-                SvsmError::SevSnp(SevSnpError::FAIL_SIZEMISMATCH(_)) => {
-                    pvalidate_range_4k(MemoryRegion::new(addr, PAGE_SIZE_2M), valid)
-                }
-                _ => Err(err),
-            })?;
-            addr = addr + PAGE_SIZE_2M;
-        } else {
-            pvalidate(addr, PageSize::Regular, valid)?;
-            addr = addr + PAGE_SIZE;
-        }
-    }
-
-    Ok(())
-}
-
 /// The desired state of the page passed to PVALIDATE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum PvalidateOp {
+    #[allow(dead_code)]
     Invalid = 0,
     Valid = 1,
 }
@@ -156,44 +98,6 @@ pub fn pvalidate(vaddr: VirtAddr, size: PageSize, valid: PvalidateOp) -> Result<
     }
 }
 
-/// Executes the vmmcall instruction.
-/// # Safety
-/// See cpu vendor documentation for what this can do.
-pub unsafe fn raw_vmmcall(eax: u32, ebx: u32, ecx: u32, edx: u32) -> i32 {
-    let new_eax;
-    asm!(
-            // bx register is reserved by llvm so it can't be passed in directly and must be
-            // restored
-            "xchg %rbx, {0:r}",
-            "vmmcall",
-            "xchg %rbx, {0:r}",
-            in(reg) ebx as u64,
-            inout("eax") eax => new_eax,
-            in("ecx") ecx,
-            in("edx") edx,
-            options(att_syntax));
-    new_eax
-}
-
-/// Sets the dr7 register to the given value
-/// # Safety
-/// See cpu vendor documentation for what this can do.
-pub unsafe fn set_dr7(new_val: u64) {
-    asm!("mov {0}, %dr7", in(reg) new_val, options(att_syntax));
-}
-
-pub fn get_dr7() -> u64 {
-    let out;
-    unsafe { asm!("mov %dr7, {0}", out(reg) out, options(att_syntax)) };
-    out
-}
-
-pub fn raw_vmgexit() {
-    unsafe {
-        asm!("rep; vmmcall", options(att_syntax));
-    }
-}
-
 bitflags::bitflags! {
     #[derive(Debug)]
     pub struct RMPFlags: u64 {
@@ -211,25 +115,6 @@ bitflags::bitflags! {
         const RWX = Self::READ.bits() | Self::WRITE.bits() | Self::X_USER.bits() | Self::X_SUPER.bits();
         const VMSA = Self::READ.bits() | Self::BIT_VMSA.bits();
     }
-}
-
-pub fn rmp_query(addr: VirtAddr, target_vmpl: u64) {
-
-    let rdx = target_vmpl;
-    let rax = addr.bits();
-    let rcx = 0u64;
-    let mut ret: u64;
-    let mut ex: u64;
-
-    unsafe {
-        asm!("1: .byte 0xf3, 0x0f, 0x01, 0xfd",
-             inout("rax") rax => ex,
-             inout("rdx") rdx => ret,
-             in("rcx") rcx,
-             options(att_syntax)
-        );
-    }
-    log::debug!("RMP Permissions({}): {:x?}",ex, (ret << 48) >> (48 + 8));
 }
 
 pub fn rmp_adjust(addr: VirtAddr, flags: RMPFlags, size: PageSize) -> Result<(), SvsmError> {
@@ -282,10 +167,6 @@ pub fn rmp_revoke_guest_access(vaddr: VirtAddr, size: PageSize) -> Result<(), Sv
     Ok(())
 }
 
-pub fn rmp_grant_guest_access(vaddr: VirtAddr, size: PageSize) -> Result<(), SvsmError> {
-    rmp_adjust(vaddr, RMPFlags::GUEST_VMPL | RMPFlags::RWX, size)
-}
-
 pub fn rmp_set_guest_vmsa(vaddr: VirtAddr) -> Result<(), SvsmError> {
     rmp_revoke_guest_access(vaddr, PageSize::Regular)?;
     rmp_adjust(
@@ -293,9 +174,4 @@ pub fn rmp_set_guest_vmsa(vaddr: VirtAddr) -> Result<(), SvsmError> {
         RMPFlags::GUEST_VMPL | RMPFlags::VMSA,
         PageSize::Regular,
     )
-}
-
-pub fn rmp_clear_guest_vmsa(vaddr: VirtAddr) -> Result<(), SvsmError> {
-    rmp_revoke_guest_access(vaddr, PageSize::Regular)?;
-    rmp_grant_guest_access(vaddr, PageSize::Regular)
 }
