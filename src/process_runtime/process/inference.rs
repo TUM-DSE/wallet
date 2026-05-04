@@ -44,6 +44,8 @@ pub struct InferContextData {
     pub engine: [u8; 64],
     pub id: u64,
 }
+
+#[allow(dead_code)]
 #[repr(C)]
 pub struct InferRequestData {
     pub prompt: [u8; 0],

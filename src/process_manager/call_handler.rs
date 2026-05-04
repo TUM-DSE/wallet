@@ -172,6 +172,20 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
             crate::process_runtime::process::inference::response_store(params),
         MonitorCallType::GpuApi =>
             crate::gpu::handle_api_call(params),
+        MonitorCallType::GpuSetup =>
+            crate::gpu::direct::register_engine(params),
+        MonitorCallType::GpuRun =>
+            crate::gpu::direct::run(params),
+        MonitorCallType::DonateCpu =>
+            crate::exclusive::r#loop::run_exclusive(params),
+        MonitorCallType::RunCpu =>
+            crate::exclusive::scheduling::run_wakeup(params),
+        MonitorCallType::PauseCpu =>
+            crate::exclusive::scheduling::run_sleep(params),
+        MonitorCallType::ReturnCpu =>
+            crate::exclusive::scheduling::run_exit(params),
+        MonitorCallType::RegisterCpuClient =>
+            crate::exclusive::r#loop::run_register(params),
         _ => Err(MonitorError::unsupported()),
     };
 

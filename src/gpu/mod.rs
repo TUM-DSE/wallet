@@ -1,11 +1,19 @@
-use crate::{address::PhysAddr, memory::paging::PerCPUPageMappingGuard, process_manager::process_paging::ProcessPageTableRef, MonitorError, RequestParams};
+#[allow(unused_imports)]
+use crate::{address::PhysAddr, memory::paging::PerCPUPageMappingGuard, process_manager::{outb::capture, process_paging::ProcessPageTableRef}, MonitorError, RequestParams};
 
 mod api;
+pub mod direct;
 
-pub fn handle_api_call(params: &mut RequestParams) -> Result<(), MonitorError> {
+
+pub fn handle_api_call(_params: &mut RequestParams) -> Result<(), MonitorError> {
+    return Ok(());
+    /*
+    //capture(10);
     let api_id = params.rcx;
     let api_arg_size: u64 = params.rdx;
     let api_arg_addr = params.r8;
+    //capture(11);
+    //return Ok(());
     //let guest_page = params.r9;
 
     let arg_mapping = PerCPUPageMappingGuard::create_4k(PhysAddr::from(api_arg_addr)).unwrap();
@@ -22,10 +30,11 @@ pub fn handle_api_call(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     let src_ptr = vec.as_ptr();
     unsafe {core::ptr::copy(src_ptr, args, api_arg_size.try_into().unwrap());};
-
-    Ok(())
+    //capture(11);
+    Ok(())*/
 }
 
+#[allow(unused)]
 fn match_id_to_func(args: *mut u8, size: u64, id: u64){
     //TODO: Check allocation/Limit size
     if api::CudaApiCall::CUDA_API_CALL_cudaMallocManaged.0 >= id &&

@@ -25,7 +25,6 @@ use num_enum::TryFromPrimitive;
 use super::PALContext;
 use super::runtime::ProcessRuntime;
 use super::runtime::TRUSTLET_VMPL;
-use super::TrustletReturnType;
 
 /// Invocation type of invokeTrustlet
 #[derive(Debug,Clone,Copy,Eq,PartialEq,TryFromPrimitive)]
