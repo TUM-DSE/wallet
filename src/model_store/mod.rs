@@ -38,7 +38,10 @@ fn load_init(params: &mut RequestParams) -> AllocationRange {
     let mut range = AllocationRange(0,0);
     let (_map, page_table) = paddr_as_slice!(guest_pgd.into());
 
-    range.allocate_for_guest(((size + PAGE_SIZE_4K) & !PAGE_SIZE_4K) / PAGE_SIZE_4K);
+    log::debug!("Allocating page for guest");
+//    range.allocate_for_guest(((size + PAGE_SIZE_4K) & !PAGE_SIZE_4K) / PAGE_SIZE_4K);
+    range.allocate_for_guest(size.div_ceil(PAGE_SIZE_4K));
+    log::debug!("Allocation successful");
 
     capture(201);
     range.guest_write_access();
