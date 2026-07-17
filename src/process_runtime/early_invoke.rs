@@ -40,7 +40,14 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
             r9:  core::ptr::null_mut()},
     };
 
-    _ = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+    //_ = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+    log::info!("Successfully called PALContext");
+    let ok = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
+    log::info!("register_guest_vmsa(vmpl={}, sev_features={:x}) -> {}",
+               TRUSTLET_VMPL, sev_features, ok);
+    if !ok {
+        panic!("register_guest_vmsa failed");
+    }
 
     loop {
         _ = switch_to_vmpl(TRUSTLET_VMPL);
