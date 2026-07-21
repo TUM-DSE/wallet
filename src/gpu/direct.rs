@@ -102,7 +102,7 @@ pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
                 break;
             }
 
-            if let Some((req_len, resp_len)) = forward_spec(call_id) {
+            if let Some((req_len, resp_len)) = forward_spec(call_id, &args.data) {
                 match service {
                     Some(service) => {
                         service.data[..req_len].copy_from_slice(&args.data[..req_len]);
@@ -126,10 +126,17 @@ pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
 
 }
 
+/// cudaMemcpy payload travels inline after a 32-byte request header.
+const MEMCPY_HDR: usize = 32;
+const MEMCPY_MAX_PAYLOAD: usize = 4091 - MEMCPY_HDR;
+
+const MEMCPY_HOST_TO_DEVICE: i32 = 1;
+const MEMCPY_DEVICE_TO_HOST: i32 = 2;
+
 /// (request bytes, response bytes) exchanged through the data area for
 /// each CUDA call the service implements; None means ack-and-drop.
 /// Layouts are shared with redirect/filter.py and service/service.c.
-fn forward_spec(call_id: u32) -> Option<(usize, usize)> {
+fn forward_spec(call_id: u32, data: &[u8; 4091]) -> Option<(usize, usize)> {
     use super::api::CudaApiCall as C;
     let id = call_id as u64;
     if id == C::CUDA_API_CALL_cudaGetDeviceCount.0 {
@@ -138,6 +145,19 @@ fn forward_spec(call_id: u32) -> Option<(usize, usize)> {
     } else if id == C::CUDA_API_CALL_cudaMalloc.0 {
         // request: u64 size; response: int32 err, pad, u64 device ptr
         Some((8, 16))
+    } else if id == C::CUDA_API_CALL_cudaFree.0 {
+        // request: u64 device ptr; response: int32 err
+        Some((8, 4))
+    } else if id == C::CUDA_API_CALL_cudaMemcpy.0 {
+        // header: u64 dst, u64 src, u64 count, int32 kind; the payload
+        // direction depends on kind. Clamped to the page capacity — the
+        // client warns about the truncation (bulk transfers TBD).
+        let count = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+        let kind = i32::from_le_bytes(data[24..28].try_into().unwrap());
+        let payload = count.min(MEMCPY_MAX_PAYLOAD);
+        let req = MEMCPY_HDR + if kind == MEMCPY_HOST_TO_DEVICE { payload } else { 0 };
+        let resp = if kind == MEMCPY_DEVICE_TO_HOST { MEMCPY_HDR + payload } else { 4 };
+        Some((req, resp))
     } else {
         None
     }
