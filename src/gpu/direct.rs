@@ -148,6 +148,13 @@ fn forward_spec(call_id: u32, data: &[u8; 4091]) -> Option<(usize, usize)> {
     } else if id == C::CUDA_API_CALL_cudaFree.0 {
         // request: u64 device ptr; response: int32 err
         Some((8, 4))
+    } else if id == C::CUDA_API_CALL_cudaDeviceSynchronize.0 {
+        // response: int32 err
+        Some((0, 4))
+    } else if id == C::CUDA_API_CALL_cudaLaunchKernel.0 {
+        // request: u64 func, grid/block dims, u64 shared, u64 stream,
+        // then the simple_add args (experiment-only); response: int32 err
+        Some((64, 4))
     } else if id == C::CUDA_API_CALL_cudaMemcpy.0 {
         // header: u64 dst, u64 src, u64 count, int32 kind; the payload
         // direction depends on kind. Clamped to the page capacity — the
