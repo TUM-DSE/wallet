@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::{address::PhysAddr, memory::paging::PerCPUPageMappingGuard, process_manager::{outb::capture, process_paging::ProcessPageTableRef}, MonitorError, RequestParams};
 
-mod api;
+pub mod api;
 pub mod direct;
 
 
