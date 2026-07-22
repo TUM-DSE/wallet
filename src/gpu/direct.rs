@@ -11,13 +11,20 @@ fn get_apic_id() -> u32 {
     unsafe { wallet_get_apic_id() }
 }
 
+/// Usable payload bytes: one 4 KiB page minus the 8-byte lock/id header.
+/// data[4091] would make the struct 4100 bytes and the tail of `data`
+/// would fall outside the single mapped page (GP fault on CPU 8).
+pub const COMM_DATA_SIZE: usize = 4088;
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct CommunicationPage {
     pub lock: AtomicU8,
     pub id: AtomicU32,//u32,
-    pub data: [u8;4091],
+    pub data: [u8; COMM_DATA_SIZE],
 }
+
+const _: () = assert!(core::mem::size_of::<CommunicationPage>() == 4096);
 
 static mut ENGINE_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
 
@@ -128,15 +135,25 @@ pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
 
 /// cudaMemcpy payload travels inline after a 32-byte request header.
 const MEMCPY_HDR: usize = 32;
-const MEMCPY_MAX_PAYLOAD: usize = 4091 - MEMCPY_HDR;
+const MEMCPY_MAX_PAYLOAD: usize = COMM_DATA_SIZE - MEMCPY_HDR;
 
 const MEMCPY_HOST_TO_DEVICE: i32 = 1;
 const MEMCPY_DEVICE_TO_HOST: i32 = 2;
 
+/// Registration control messages (fatbin transfer + kernel lookup),
+/// relayed as full pages: startup-only, not performance sensitive.
+const CTRL_FIRST: u64 = 501; // FATBIN_INIT
+const CTRL_LAST: u64 = 504; // REGISTER_FUNC
+
+/// cudaLaunchKernel: kernel params packed after a 56-byte header at the
+/// driver-provided offsets; args_len is a u32 at request offset 48.
+const LAUNCH_HDR: usize = 56;
+const LAUNCH_MAX_ARGS: usize = COMM_DATA_SIZE - LAUNCH_HDR;
+
 /// (request bytes, response bytes) exchanged through the data area for
 /// each CUDA call the service implements; None means ack-and-drop.
 /// Layouts are shared with redirect/filter.py and service/service.c.
-fn forward_spec(call_id: u32, data: &[u8; 4091]) -> Option<(usize, usize)> {
+fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usize)> {
     use super::api::CudaApiCall as C;
     let id = call_id as u64;
     if id == C::CUDA_API_CALL_cudaGetDeviceCount.0 {
@@ -153,8 +170,14 @@ fn forward_spec(call_id: u32, data: &[u8; 4091]) -> Option<(usize, usize)> {
         Some((0, 4))
     } else if id == C::CUDA_API_CALL_cudaLaunchKernel.0 {
         // request: u64 func, grid/block dims, u64 shared, u64 stream,
-        // then the simple_add args (experiment-only); response: int32 err
-        Some((64, 4))
+        // u32 args_len, then params packed at driver-provided offsets;
+        // response: int32 err
+        let args_len =
+            u32::from_le_bytes(data[48..52].try_into().unwrap()) as usize;
+        Some((LAUNCH_HDR + args_len.min(LAUNCH_MAX_ARGS), 4))
+    } else if id >= CTRL_FIRST && id <= CTRL_LAST {
+        // registration control messages: full data-area relay both ways
+        Some((COMM_DATA_SIZE, COMM_DATA_SIZE))
     } else if id == C::CUDA_API_CALL_cudaMemcpy.0 {
         // header: u64 dst, u64 src, u64 count, int32 kind; the payload
         // direction depends on kind. Clamped to the page capacity — the
