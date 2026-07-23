@@ -42,24 +42,133 @@ pub fn register_service(params: &mut RequestParams) -> Result<(), MonitorError> 
 }
 
 pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
-    //let engine_page =
     // Args:
-    //  shared page phys address
-    //  page table pyhs address
-    //let a: CommunicationPage = CommunicationPage {lock: 0.into(), data: 0};
+    //  rcx: shared page phys address
+    //  rdx: page table phys address
+    //  r8:  target polling core (explicit - the donated core is offline
+    //       in the guest, so nothing can pin there to register via the
+    //       caller's apic id; values >= 64 fall back to caller-apic
+    //       indexing for the legacy parked path)
+    // Returns (rcx): 1 if a donated poller is live on that core (the
+    // client must not park a thread), 0 otherwise.
     let page_table = params.rdx;
     let comm_page = params.rcx;
-    log::warn!("Registraton: {:#x?} {:#x?}", page_table, comm_page);
+    let core = params.r8 as usize;
+    let id = if core < 64 { core } else { get_apic_id() as usize };
+    log::warn!("Registraton: {:#x?} {:#x?} core {}", page_table, comm_page, id);
 
-    let id = get_apic_id() as usize;
     unsafe {
         ENGINE_PAGE_TABLE[id] = PhysAddr::from(page_table);
         ENGINE_PAGES[id] = PhysAddr::from(comm_page);
     };
 
+    let donated = unsafe { crate::exclusive::CONTROL[id] } != PhysAddr::null();
+    params.rcx = donated as u64;
+
     Ok(())
 }
 
+/// True when a client comm page is registered for `core`. Used by the
+/// donated-core command loop to decide when to enter `poll_engine`.
+pub fn engine_registered(core: usize) -> bool {
+    core < 64 && unsafe { ENGINE_PAGES[core] } != PhysAddr::null()
+}
+
+/// Poll the engine page registered for `core` and relay calls to the
+/// service. Returns when the client stops (id 500) or its registration
+/// disappears — return value LOOP_CLEAR — or, when `ctr` is given
+/// (donated-core mode), when a LOOP_* command arrives on the control
+/// page; the consumed command is returned for the caller to handle.
+///
+/// The registration is re-read every iteration: a new client's
+/// register_engine replaces a dead client's page, so a crashed client
+/// cannot wedge the poller — the next registration just remaps. The
+/// service mapping likewise follows SERVICE_PAGE re-registrations.
+pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -> u64 {
+    use crate::exclusive::LOOP_CLEAR;
+
+    let mut engine_phys = PhysAddr::null();
+    let mut engine_mapping: Option<PerCPUPageMappingGuard> = None;
+    let mut service_phys = PhysAddr::null();
+    let mut service_mapping: Option<PerCPUPageMappingGuard> = None;
+
+    loop {
+        if let Some(ctr) = ctr {
+            let cmd = ctr.next.swap(LOOP_CLEAR, Ordering::Relaxed);
+            if cmd != LOOP_CLEAR {
+                return cmd;
+            }
+        }
+
+        let current = unsafe { ENGINE_PAGES[core] };
+        if current == PhysAddr::null() {
+            return LOOP_CLEAR;
+        }
+        if current != engine_phys {
+            engine_mapping = Some(PerCPUPageMappingGuard::create_4k(current).unwrap());
+            engine_phys = current;
+        }
+        let args_ptr: *mut CommunicationPage =
+            engine_mapping.as_ref().unwrap().virt_addr().as_mut_ptr::<CommunicationPage>();
+        let args = unsafe { &mut *args_ptr };
+
+        let valid_call = args.lock.load(Ordering::Acquire);
+        if valid_call == 0 {
+            continue;
+        }
+        let call_id = args.id.load(Ordering::Relaxed);
+
+        // Map lazily and remap when the service re-registers (each
+        // forwarded session starts a fresh service process).
+        let sp = unsafe { SERVICE_PAGE };
+        if sp != service_phys {
+            service_mapping = if sp == PhysAddr::null() {
+                None
+            } else {
+                Some(PerCPUPageMappingGuard::create_4k(sp).unwrap())
+            };
+            service_phys = sp;
+        }
+        let service: Option<&mut CommunicationPage> = service_mapping.as_ref().map(|m| {
+            let ptr: *mut CommunicationPage = m.virt_addr().as_mut_ptr::<CommunicationPage>();
+            unsafe { &mut *ptr }
+        });
+
+        if call_id == 500 {
+            if let Some(service) = service {
+                forward_call(service, call_id);
+            }
+            args.lock.store(0, Ordering::Release);
+            // Session over: drop the registration so the poller goes
+            // idle until the next client registers.
+            unsafe { ENGINE_PAGES[core] = PhysAddr::null(); }
+            return LOOP_CLEAR;
+        }
+
+        if let Some((req_len, resp_len)) = forward_spec(call_id, &args.data) {
+            match service {
+                Some(service) => {
+                    service.data[..req_len].copy_from_slice(&args.data[..req_len]);
+                    forward_call(service, call_id);
+                    args.data[..resp_len].copy_from_slice(&service.data[..resp_len]);
+                }
+                None => {
+                    // No service registered: fail the call with
+                    // cudaErrorSystemNotReady (802) instead of pretending
+                    // it succeeded.
+                    args.data[..resp_len].fill(0);
+                    args.data[0..4].copy_from_slice(&802i32.to_le_bytes());
+                }
+            }
+        }
+
+        args.lock.store(0, Ordering::Release);
+    }
+}
+
+/// Legacy parked-thread path (GpuRun): the client thread pinned to the
+/// polling core enters here and the call only returns on the client's
+/// stop message. Kept for A/B comparison with donated-core polling.
 pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
 
     let id = get_apic_id() as usize;
@@ -69,66 +178,10 @@ pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
     log::warn!("Monitor polling on {:#x?} on thread {}", engine_page, id);
     if engine_page == PhysAddr::null() {
         log::warn!("No engine found");
-        let mut counter: u64 = 0;
-        loop{ counter = counter.wrapping_add(1); log::warn!("Failed {}", counter); if counter == 10000 { break;} }
         return Ok(())
-        //return Err(MonitorError::invalid_params());
     }
 
-    let arg_mapping = PerCPUPageMappingGuard::create_4k(PhysAddr::from(engine_page)).unwrap();
-
-    let args_ptr: *mut CommunicationPage = arg_mapping.virt_addr().as_mut_ptr::<CommunicationPage>();
-
-    let args = unsafe {&mut *args_ptr};
-
-    // The service page is mapped lazily on first use so the service may
-    // register after the client has already parked this CPU in the loop.
-    let mut service_mapping: Option<PerCPUPageMappingGuard> = None;
-
-    loop {
-        let valid_call = args.lock.load(Ordering::Acquire);
-        if valid_call != 0 {
-            let call_id = args.id.load(Ordering::Relaxed);
-
-            if service_mapping.is_none() {
-                let service_page = unsafe { SERVICE_PAGE };
-                if service_page != PhysAddr::null() {
-                    service_mapping = Some(PerCPUPageMappingGuard::create_4k(service_page).unwrap());
-                }
-            }
-            let service: Option<&mut CommunicationPage> = service_mapping.as_ref().map(|m| {
-                let ptr: *mut CommunicationPage = m.virt_addr().as_mut_ptr::<CommunicationPage>();
-                unsafe { &mut *ptr }
-            });
-
-            if call_id == 500 {
-                if let Some(service) = service {
-                    forward_call(service, call_id);
-                }
-                args.lock.store(0, Ordering::Release);
-                break;
-            }
-
-            if let Some((req_len, resp_len)) = forward_spec(call_id, &args.data) {
-                match service {
-                    Some(service) => {
-                        service.data[..req_len].copy_from_slice(&args.data[..req_len]);
-                        forward_call(service, call_id);
-                        args.data[..resp_len].copy_from_slice(&service.data[..resp_len]);
-                    }
-                    None => {
-                        // No service registered: fail the call with
-                        // cudaErrorSystemNotReady (802) instead of pretending
-                        // it succeeded.
-                        args.data[..resp_len].fill(0);
-                        args.data[0..4].copy_from_slice(&802i32.to_le_bytes());
-                    }
-                }
-            }
-
-            args.lock.store(0, Ordering::Release);
-        }
-    }
+    poll_engine(id, None);
     Ok(())
 
 }

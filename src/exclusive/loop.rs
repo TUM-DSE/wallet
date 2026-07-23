@@ -18,10 +18,24 @@ fn enter_guest(){
     unsafe {wallet_enter_guest();};
 }
 
-pub fn run_register(_params: &mut RequestParams) -> Result<(), MonitorError> {
-    Ok(())
+/// Handle a LOOP_* command consumed off the control page. Returns true
+/// when the exclusive loop should exit (LOOP_EXIT). LOOP_SLEEP hlt-s
+/// until LOOP_WAKEUP.
+fn handle_command(ctr: &mut ControlStruct, cmd: u64) -> bool {
+    if cmd == LOOP_EXIT {
+        return true;
+    }
+    if cmd == LOOP_SLEEP {
+        loop {
+            sleep(ctr);
+            let cmd = ctr.next.swap(LOOP_CLEAR, Ordering::Relaxed);
+            if cmd == LOOP_WAKEUP {
+                break;
+            }
+        }
+    }
+    false
 }
-
 
 pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
     let id = get_apic_id() as usize;
@@ -65,23 +79,34 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
     //let comm_ptr: *mut u64 = mapping.virt_addr().as_mut_ptr::<u64>();
     //let comm: &mut u64 = unsafe {&mut *comm_ptr};
 
-
+    let mut heartbeat: u64 = 0;
     loop {
         let cmd = ctr.next.swap(LOOP_CLEAR, Ordering::Relaxed);
         if cmd != LOOP_CLEAR {
-            if cmd == LOOP_EXIT {
+            if handle_command(ctr, cmd) {
                 break;
             }
-            if cmd == LOOP_SLEEP {
-                loop {
-                    sleep(ctr);
-                    let cmd = ctr.next.swap(LOOP_CLEAR, Ordering::Relaxed);
-                    if cmd == LOOP_WAKEUP {
-                        break;
-                    }
-                }
+            continue;
+        }
+        // GPU polling: when a client has registered a comm page for
+        // this core (register_engine with explicit target core), relay
+        // its calls until the session ends (stop id 500 clears the
+        // registration) or a LOOP_* command arrives. poll_engine
+        // re-reads the registration every iteration, so a crashed
+        // client is replaced by the next one's registration without
+        // any reboot.
+        if crate::gpu::direct::engine_registered(id) {
+            log::warn!("Donated core {}: polling GPU engine page", id);
+            let cmd = crate::gpu::direct::poll_engine(id, Some(&*ctr));
+            log::warn!("Donated core {}: GPU session ended ({})", id, cmd);
+            if cmd != LOOP_CLEAR && handle_command(ctr, cmd) {
+                break;
             }
             continue;
+        }
+        heartbeat += 1;
+        if(heartbeat % 1000000000 == 0) {
+            log::warn!("shuttle heartbeat: {}", heartbeat);
         }
     }
 
