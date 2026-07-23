@@ -57,6 +57,10 @@ impl ProcessRuntimeExit for PALContext {
         let exit_code = self.vmsa.rbx;
         log::info!(" [Trustlet] Exit with Status Code: {}", exit_code);
         self.return_values.result(TrustletReturnType::EXIT as u64);
+        // Binary-entrypoint trustlets have no result channel; their
+        // exit status IS the result. rdx lands in the guest's
+        // call.generic.values[1] (see trustlet.c invocationExit).
+        self.return_values.set_rdx(exit_code);
         RETURN_TO_GUEST
     }
 

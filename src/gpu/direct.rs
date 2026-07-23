@@ -98,6 +98,8 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
     let mut engine_mapping: Option<PerCPUPageMappingGuard> = None;
     let mut service_phys = PhysAddr::null();
     let mut service_mapping: Option<PerCPUPageMappingGuard> = None;
+    let mut idle_beats: u64 = 0;
+    let mut last_id: u32 = 0;
 
     loop {
         if let Some(ctr) = ctr {
@@ -121,9 +123,18 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
 
         let valid_call = args.lock.load(Ordering::Acquire);
         if valid_call == 0 {
+            // Session-poll heartbeat: distinguishes "waiting for the
+            // next call on this page" from being stuck relaying one
+            // (silent-hang diagnosis; ~seconds per beat).
+            idle_beats = idle_beats.wrapping_add(1u64);
+            if idle_beats % 4_000_000_000u64 == 0 {
+                log::warn!("poll_engine[{}]: alive, waiting on {:#x?} (last id {})",
+                           core, engine_phys, last_id);
+            }
             continue;
         }
         let call_id = args.id.load(Ordering::Relaxed);
+        last_id = call_id;
 
         // Map lazily and remap when the service re-registers (each
         // forwarded session starts a fresh service process).
@@ -258,5 +269,12 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
 fn forward_call(service: &mut CommunicationPage, call_id: u32) {
     service.id.store(call_id, Ordering::Relaxed);
     service.lock.store(1, Ordering::Release);
-    while service.lock.load(Ordering::Acquire) != 0 {}
+    let mut spins: u64 = 0;
+    while service.lock.load(Ordering::Acquire) != 0 {
+        spins = spins.wrapping_add(1);
+        if spins % 4_000_000_000u64 == 0 {
+            log::warn!("forward_call: still waiting on service for id {} ({}B spins)",
+                       call_id, spins / 1_000_000_000);
+        }
+    }
 }
