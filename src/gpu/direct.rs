@@ -74,6 +74,13 @@ pub fn engine_registered(core: usize) -> bool {
     core < 64 && unsafe { ENGINE_PAGES[core] } != PhysAddr::null()
 }
 
+/// Register a monitor-provisioned comm page (trustlet GPU channel) in
+/// `core`'s engine slot — same slot and polling as a guest client's
+/// page registered via register_engine.
+pub fn register_engine_page(core: usize, page: PhysAddr) {
+    unsafe { ENGINE_PAGES[core] = page; }
+}
+
 /// Poll the engine page registered for `core` and relay calls to the
 /// service. Returns when the client stops (id 500) or its registration
 /// disappears — return value LOOP_CLEAR — or, when `ctr` is given

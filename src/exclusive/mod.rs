@@ -29,6 +29,18 @@ pub fn set_next(next: &mut AtomicU64, o: u64, n: u64) {
 }
 
 pub static mut CONTROL: [PhysAddr; 64] = [PhysAddr::null(); 64];
+
+/// The core currently donated to the monitor (its exclusive command
+/// loop is live), if any. Used to route trustlet GPU channels to the
+/// polling core.
+pub fn donated_core() -> Option<usize> {
+    for i in 0..64 {
+        if unsafe { CONTROL[i] } != PhysAddr::null() {
+            return Some(i);
+        }
+    }
+    None
+}
 pub static LOOP_CLEAR: u64 = 0;
 pub static LOOP_EXIT: u64 = 1;
 pub static LOOP_SLEEP: u64 = 2;
