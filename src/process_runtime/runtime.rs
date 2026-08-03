@@ -23,6 +23,7 @@ use super::process::exit::ProcessRuntimeExit;
 use super::process::request::ProcessRuntimeGuestRequest;
 use super::process::inference::ProcessRuntimeInference;
 use super::process::gpu::ProcessRuntimeGpu;
+use super::process::model::ProcessRuntimeModel;
 pub use super::early_invoke::early_invoke;
 pub use super::invoke::invoke_trustlet;
 
@@ -36,7 +37,8 @@ pub trait ProcessRuntime:
     ProcessRuntimeExit +
     ProcessRuntimeGuestRequest +
     ProcessRuntimeInference +
-    ProcessRuntimeGpu {
+    ProcessRuntimeGpu +
+    ProcessRuntimeModel {
     fn handle_process_request(&mut self) -> bool;
 }
 
@@ -103,6 +105,10 @@ impl ProcessRuntime for PALContext  {
 
             ProcessCallType::GpuChannel => {
                 return self.pal_svsm_gpu_channel();
+            }
+
+            ProcessCallType::ModelChannel => {
+                return self.pal_svsm_model_channel();
             }
 
             // monitor calls (other)

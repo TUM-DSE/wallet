@@ -101,6 +101,41 @@ impl AllocationRange {
 
     }
 
+    /// Grant a VMPL1 trustlet read access to this range (model_channel:
+    /// the model store maps read-only into the trustlet). The subtree's
+    /// page-table pages get RWX like in guest_write_access — the
+    /// hardware walker reads them and writes A/D bits at the accessing
+    /// VMPL; the data pages get READ only. Mounts the range into the
+    /// monitor's PT for the data-page pass, mirroring the load path.
+    pub fn trustlet_read_access(&self) {
+        let pgd_table_entry = ProcessPageTableEntry(PhysAddr::from(self.0));
+        let (mapping1, pud_table) = paddr_as_table!(strip_paddr!(pgd_table_entry.0));
+        let _ = rmp_adjust(mapping1.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular);
+        for i in 0..512 {
+            let pud_table_entry = pud_table[i];
+            if !pud_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                break
+            }
+
+            let (mapping2, pmd_table) = paddr_as_table!(strip_paddr!(pud_table_entry.0));
+            let _ = rmp_adjust(mapping2.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular);
+            for i in 0..512 {
+                let pmd_table_entry = pmd_table[i];
+                if !pmd_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                    break
+                }
+
+                let (mapping3, _pte_table) = paddr_as_table!(strip_paddr!(pmd_table_entry.0));
+                let _ = rmp_adjust(mapping3.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular);
+            }
+        }
+        self.mount();
+        for i in 0..(self.1 as usize) {
+            let _ = rmp_adjust((ALLOCATION_VADDR_START as usize + i * PAGE_SIZE).into(), RMPFlags::VMPL1 | RMPFlags::READ, PageSize::Regular);
+        }
+        self.unmount();
+    }
+
     fn allocate_(&mut self, page_table_ref: &mut ProcessPageTableRef, pages: u64, start_addr: u64, mount: bool, user: bool){
         // Reuses the Process page managment to add new memory to the Monitor
         //let mut page_table_ref = ProcessPageTableRef::default();

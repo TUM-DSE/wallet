@@ -51,6 +51,10 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
 
     loop {
         _ = switch_to_vmpl(TRUSTLET_VMPL);
+        let rip = rc.vmsa.rip;
+        let rax = rc.vmsa.rax;
+        let exit = rc.vmsa.guest_exit_code;
+        //log::info!("trustlet exit: rip={:x} rax={:x} exit={:x?}", rip, rax, exit);
         if !rc.handle_process_request(){
             break;
         }

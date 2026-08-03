@@ -216,6 +216,15 @@ const MEMCPY_DEVICE_TO_HOST: i32 = 2;
 const CTRL_FIRST: u64 = 501; // FATBIN_INIT
 const CTRL_LAST: u64 = 504; // REGISTER_FUNC
 
+/// cuBLAS forwarding (1.4b): ids 600+ are reserved outside the cudart
+/// enumeration; layouts shared with redirect/filter.py and
+/// service/service.c.
+const CUBLAS_CREATE: u64 = 600;
+const CUBLAS_DESTROY: u64 = 601;
+const CUBLAS_SET_STREAM: u64 = 602;
+const CUBLAS_SET_MATH_MODE: u64 = 603;
+const CUBLAS_GEMM_STRIDED_BATCHED_EX: u64 = 604;
+
 /// cudaLaunchKernel: kernel params packed after a 56-byte header at the
 /// driver-provided offsets; args_len is a u32 at request offset 48.
 const LAUNCH_HDR: usize = 56;
@@ -249,6 +258,47 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
     } else if id >= CTRL_FIRST && id <= CTRL_LAST {
         // registration control messages: full data-area relay both ways
         Some((COMM_DATA_SIZE, COMM_DATA_SIZE))
+    } else if id == C::CUDA_API_CALL_cudaGetDeviceProperties_v2.0 {
+        // req: i32 device; resp: i32 err @0, cudaDeviceProp @8 —
+        // relay the whole page rather than tracking the prop size
+        Some((4, COMM_DATA_SIZE))
+    } else if id == C::CUDA_API_CALL_cudaMemGetInfo.0 {
+        // resp: i32 err @0, u64 free @8, u64 total @16
+        Some((0, 24))
+    } else if id == C::CUDA_API_CALL_cudaMemset.0 {
+        // req: u64 ptr, u64 count, i32 value (Async variant reuses
+        // this id client-side); resp: i32 err
+        Some((20, 4))
+    } else if id == C::CUDA_API_CALL_cudaFuncSetAttribute.0 {
+        // req: u64 hostFun, i32 attr, i32 value; resp: i32 err
+        Some((16, 4))
+    } else if id == C::CUDA_API_CALL_cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags.0 {
+        // req: u64 hostFun, i32 blockSize, u64 smem @16, u32 flags @24;
+        // resp: i32 err, i32 numBlocks
+        Some((28, 8))
+    } else if id == C::CUDA_API_CALL_cudaStreamCreateWithFlags.0 {
+        // req: u32 flags; resp: i32 err @0, u64 handle @8
+        Some((4, 16))
+    } else if id == C::CUDA_API_CALL_cudaStreamDestroy.0
+        || id == C::CUDA_API_CALL_cudaStreamSynchronize.0 {
+        // req: u64 handle; resp: i32 err
+        Some((8, 4))
+    } else if id == CUBLAS_CREATE {
+        // resp: i32 status @0, u64 handle token @8
+        Some((0, 16))
+    } else if id == CUBLAS_DESTROY {
+        // req: u64 handle; resp: i32 status
+        Some((8, 4))
+    } else if id == CUBLAS_SET_STREAM {
+        // req: u64 handle, u64 stream token; resp: i32 status
+        Some((16, 4))
+    } else if id == CUBLAS_SET_MATH_MODE {
+        // req: u64 handle, i32 mode; resp: i32 status
+        Some((12, 4))
+    } else if id == CUBLAS_GEMM_STRIDED_BATCHED_EX {
+        // req: 144-byte fixed header (scalars + device pointers +
+        // inline 16-byte alpha/beta slots); resp: i32 status
+        Some((144, 4))
     } else if id == C::CUDA_API_CALL_cudaMemcpy.0 {
         // header: u64 dst, u64 src, u64 count, int32 kind; the payload
         // direction depends on kind. Clamped to the page capacity — the

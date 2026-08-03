@@ -9,3 +9,4 @@ pub mod exit;
 pub mod request;
 pub mod inference;
 pub mod gpu;
+pub mod model;

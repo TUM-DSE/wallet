@@ -263,6 +263,10 @@ impl ProcessContext {
         vmsa.cr3 = u64::from(page_table_ref.process_page_table);
         vmsa.efer = vmsa.efer | 1u64 << 12;
         vmsa.rip = base.entry_point.into();
+        let e = vmsa.rip;
+        let c3 = vmsa.cr3;
+        let sp = vmsa.rsp;
+        log::info!("trustlet entry: rip={:x} cr3={:x} rsp={:x} cpl=3 vmpl=1", e, c3, sp);
         vmsa.sev_features = old_vmsa_ptr.sev_features | 4; // 4 is for #VC Reflect
         vmsa.rflags &= !(1u64 << 9); // Clear IF;
         // New Stack
@@ -271,6 +275,7 @@ impl ProcessContext {
 
         // Setup exception handlers
 
+        log::info!("Setting up exceptions");
         setup_exceptions(vmsa, &page_table_ref);
         // ------ end of exception handlers setup
 
@@ -284,6 +289,7 @@ impl ProcessContext {
         }
 
         //Memory Channel setup -- No chain setup here
+        log::info!("Setting up page tables");
         let page_table_addr = vmsa.cr3;
         let mut pptr = ProcessPageTableRef::default();
         pptr.set_external_table(page_table_addr);
@@ -296,6 +302,8 @@ impl ProcessContext {
         //self.base = base;
         self.measurements = measurements;
         self.page_table_ref = page_table_ref;
+        log::info!("Printing Zygote VMSA");
+        log::info!("Zygote VMSA: {:x?}", vmsa);
     }
 
     /// This function is called to create a Trustlet from a Zygote

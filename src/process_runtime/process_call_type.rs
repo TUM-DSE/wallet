@@ -18,6 +18,7 @@ impl ProcessCallType {
     pub const Finalize: ProcessCallType = ProcessCallType(1342177268);
     pub const Inference: ProcessCallType = ProcessCallType(1342177267);
     pub const GpuChannel: ProcessCallType = ProcessCallType(1342177266);
+    pub const ModelChannel: ProcessCallType = ProcessCallType(1342177265);
     pub const Exception: ProcessCallType = ProcessCallType(1325400063);
     pub const HandleDf: ProcessCallType = ProcessCallType(1325400062);
     pub const CallOutb: ProcessCallType = ProcessCallType(1342177184);

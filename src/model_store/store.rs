@@ -43,6 +43,12 @@ impl<T: StoreTrait> Store<T> {
         let ptr = unsafe { self.data.get().as_mut().unwrap() };
         &mut ptr[id]
     }
+    /// Number of slots; get() panics beyond this, so callers taking
+    /// ids from an untrusted source must bounds-check first.
+    pub fn len(&self) -> usize {
+        let ptr = unsafe { self.data.get().as_mut().unwrap() };
+        ptr.len()
+    }
     #[allow(dead_code)]
     pub fn delete(&self, id: usize) {
         let ptr: &mut Vec<T> = unsafe { self.data.get().as_mut().unwrap() };
