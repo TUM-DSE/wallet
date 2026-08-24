@@ -49,6 +49,14 @@ pub fn create_channel(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     trustlet2.context.channel.input = trustlet1.context.channel.output;
 
+    // Record where trustlet1's output leads. This is the routing the
+    // inference call uses: a trustlet asks for inference and the monitor
+    // sends it to whichever trustlet the guest linked it to at
+    // deployment time - the guest decides who may call whom, and never
+    // sees the payload.
+    trustlet1.context.channel.next = Some(ProcessID(tid2.try_into().unwrap()));
+    trustlet1.context.channel.last_in_channel = false;
+
     // TODO: free trustlet2's old input channel pages
 
     Ok(())

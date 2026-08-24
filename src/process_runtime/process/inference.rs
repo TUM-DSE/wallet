@@ -89,6 +89,30 @@ impl ProcessRuntimeInference for PALContext {
         }
 
         if request_type == PalInferenceRequestType::INFERENCE {
+            /* VMPL1 path: if the guest linked this trustlet to an engine
+               trustlet with create_channel, serve the request there and
+               return straight to the caller. The prompt is already in
+               the shared channel page, so nothing is copied and nothing
+               crosses into VMPL2.
+
+               This is what retires inference/manager: on the old path
+               the monitor returned to the guest, which then used
+               prompt_get/response_store to pull the plaintext prompt
+               into a VMPL2 process and push the completion back - the
+               untrusted guest saw both. */
+            if let Some(engine) = self.process.context.channel.next {
+                let status = super::call::run_nested(self, engine.0 as u64);
+                if status != 0 {
+                    log::warn!("inference: engine trustlet {} call failed: {}",
+                               engine.0, status);
+                }
+                self.vmsa.rcx = u64::from_ne_bytes(status.to_ne_bytes());
+                return RETURN_TO_PROCESS;
+            }
+
+            /* No engine linked: fall back to the guest manager. Kept so
+               the guest-side path still works as a measurement baseline
+               - it must not be how a trustlet gets inference done. */
             let page_table = self.vmsa.cr3;
             let mut page_table_ref = ProcessPageTableRef::default();
             page_table_ref.set_external_table(page_table);
@@ -97,7 +121,7 @@ impl ProcessRuntimeInference for PALContext {
             self.return_values.set_rdx(self.vmsa.rdx);
             self.return_values.set_r8(self.vmsa.rbx);
             let s = self.vmsa.rbx;
-            log::debug!("INFER REQ PROMPT SIZE: {}", s);
+            log::warn!("inference: no engine trustlet linked, falling back to                         the guest manager (prompt crosses into VMPL2);                         prompt size {}", s);
 
             return RETURN_TO_GUEST
         }

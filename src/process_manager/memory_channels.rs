@@ -14,7 +14,10 @@ pub struct MemoryChannel {
     pub output: AllocationRange,
     pub owner: ProcessID,
     pub last_in_channel: bool,
-    pub next: ProcessID,
+    /// Where this process's OUTPUT channel leads, set by create_channel.
+    /// Option, not a bare ProcessID: process id 0 is a real process, so
+    /// there is no free sentinel value for "not linked".
+    pub next: Option<ProcessID>,
 }
 
 #[allow(dead_code)]

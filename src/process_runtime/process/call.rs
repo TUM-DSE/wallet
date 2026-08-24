@@ -55,43 +55,52 @@ impl ProcessRuntimeCall for PALContext {
     /// `nested_call` in exit.rs).
     fn pal_call_trustlet(&mut self) -> ReturnTarget {
         let callee_id = self.vmsa.rbx;
-        let caller_id = self.process.id;
+        let status = run_nested(self, callee_id);
+        self.vmsa.rcx = u64::from_ne_bytes(status.to_ne_bytes());
+        RETURN_TO_PROCESS
+    }
+}
+
+/// Run `callee_id` to its next yield and come back here. Shared by the
+/// explicit call_trustlet process call and by the inference call, which
+/// resolves its callee from the channel link instead of an argument.
+///
+/// Returns 0, or a negative status: -1 unknown/!trustlet callee,
+/// -2 self-call, -3 depth exceeded, -4 cycle.
+pub fn run_nested(ctx: &mut PALContext, callee_id: u64) -> i64 {
+    {
+        let caller_id = ctx.process.id;
 
         if callee_id == caller_id {
-            self.vmsa.rcx = u64::from_ne_bytes((-2i64).to_ne_bytes());
-            return RETURN_TO_PROCESS;
+            return -2;
         }
         if callee_id as usize >= PROCESS_STORE.len() {
             log::warn!("call_trustlet: id {} out of range", callee_id);
-            self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-            return RETURN_TO_PROCESS;
+            return -1;
         }
 
         let callee = PROCESS_STORE.get(ProcessID(callee_id as usize));
         if callee.process_type != TrustedProcessType::Trustlet {
             log::warn!("call_trustlet: {} is not a trustlet", callee_id);
-            self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-            return RETURN_TO_PROCESS;
+            return -1;
         }
 
         let depth = unsafe { CALL_DEPTH };
         if depth >= MAX_CALL_DEPTH {
             log::warn!("call_trustlet: depth {} exceeded", depth);
-            self.vmsa.rcx = u64::from_ne_bytes((-3i64).to_ne_bytes());
-            return RETURN_TO_PROCESS;
+            return -3;
         }
         for i in 0..depth as usize {
             if unsafe { CALL_STACK[i] } == callee_id {
                 log::warn!("call_trustlet: cycle back into {}", callee_id);
-                self.vmsa.rcx = u64::from_ne_bytes((-4i64).to_ne_bytes());
-                return RETURN_TO_PROCESS;
+                return -4;
             }
         }
 
         let callee_vmsa_paddr = callee.context.vmsa;
         let callee_sev_features = callee.context.sev_features;
-        let caller_vmsa_paddr = self.process.context.vmsa;
-        let caller_sev_features = self.process.context.sev_features;
+        let caller_vmsa_paddr = ctx.process.context.vmsa;
+        let caller_sev_features = ctx.process.context.sev_features;
 
         let callee_mapping = PerCPUPageMappingGuard::create_4k(callee_vmsa_paddr).unwrap();
         let callee_vmsa: &mut VMSA = unsafe {
@@ -133,8 +142,7 @@ impl ProcessRuntimeCall for PALContext {
         if !register_guest_vmsa(callee_vmsa_paddr, TRUSTLET_VMPL, callee_sev_features) {
             unsafe { CALL_DEPTH = depth; }
             log::error!("call_trustlet: register_guest_vmsa failed for {}", callee_id);
-            self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-            return RETURN_TO_PROCESS;
+            return -1;
         }
 
         /* Same loop invoke_trustlet runs, one level down. It ends when
@@ -156,7 +164,6 @@ impl ProcessRuntimeCall for PALContext {
             panic!("call_trustlet: caller VMSA re-registration failed");
         }
 
-        self.vmsa.rcx = 0;
-        RETURN_TO_PROCESS
+        0
     }
 }
