@@ -67,6 +67,13 @@ pub fn register_service(params: &mut RequestParams) -> Result<(), MonitorError> 
             SERVICE_PAGE = PhysAddr::from(comm_page);
         }
     };
+    /* Return a defined status. Without this rcx still holds the comm
+       page address on the way out, and libwallet - which takes the
+       ioctl result as an int and treats negative as failure - reports
+       "gpu_service_setup_call failed" whenever that address happens to
+       have bit 31 set. Registration then succeeds or fails depending on
+       where the page landed in physical memory. */
+    params.rcx = 0;
     Ok(())
 }
 
