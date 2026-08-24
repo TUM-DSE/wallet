@@ -121,7 +121,15 @@ impl ProcessRuntimeInference for PALContext {
             self.return_values.set_rdx(self.vmsa.rdx);
             self.return_values.set_r8(self.vmsa.rbx);
             let s = self.vmsa.rbx;
-            log::warn!("inference: no engine trustlet linked, falling back to                         the guest manager (prompt crosses into VMPL2);                         prompt size {}", s);
+            log::warn!("inference: no engine trustlet linked for {}, falling back to the guest manager (prompt crosses into VMPL2), prompt size {}", self.process.id, s);
+
+            /* Tell the trustlet what happened. Without this it
+               resumes with whatever it left in rcx - its own
+               request type - and cannot distinguish "served"
+               from "fell back to the guest", which is exactly
+               the case where it should know its prompt left
+               VMPL1. */
+            self.vmsa.rcx = u64::from_ne_bytes((-5i64).to_ne_bytes());
 
             return RETURN_TO_GUEST
         }
