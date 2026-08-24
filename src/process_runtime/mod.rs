@@ -52,6 +52,11 @@ pub struct PALContext {
     guest_page_table: u64,
     invocation_arg_guest_vaddr: u64,
     invocation_arg_size: usize,
+    /// True when this process was entered from another trustlet
+    /// (process/call.rs) rather than from the guest. There is no guest
+    /// result buffer in that case - the answer is read straight out of
+    /// the shared channel - so get_result must not copy anything out.
+    nested_call: bool,
     return_values: ReturnValues,
 }
 

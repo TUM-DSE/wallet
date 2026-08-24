@@ -30,13 +30,42 @@ static mut ENGINE_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
 
 static mut ENGINE_PAGE_TABLE: [PhysAddr; 64] = [PhysAddr::null(); 64];
 
+/// Fallback service page: one service process serving whichever engine
+/// is polling. Used when a service registers without naming an engine,
+/// which is what the pre-per-engine service binary does.
 static mut SERVICE_PAGE: PhysAddr = PhysAddr::null();
 
+/// Per-engine service pages, indexed like ENGINE_PAGES (by polling
+/// core). One service PROCESS per engine is what actually isolates
+/// engines from each other: separate contexts inside one process do
+/// not (measured - see PLAN.md Stage D-0), and a shared process also
+/// shares its fixed-size module/kernel tables across sessions.
+static mut SERVICE_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
+
+/// Which service page relays for `core`: its own if one registered,
+/// otherwise the shared fallback.
+fn service_page_for(core: usize) -> PhysAddr {
+    let own = unsafe { SERVICE_PAGES[core] };
+    if own != PhysAddr::null() {
+        return own;
+    }
+    unsafe { SERVICE_PAGE }
+}
+
 pub fn register_service(params: &mut RequestParams) -> Result<(), MonitorError> {
+    // Args:
+    //  rcx: service comm page phys address
+    //  r8:  engine this service serves (its polling core); values >= 64
+    //       mean "serve any engine", the legacy single-service mode.
     let comm_page = params.rcx;
-    log::warn!("GPU service registration: {:#x?}", comm_page);
+    let engine = params.r8 as usize;
+    log::warn!("GPU service registration: {:#x?} engine {}", comm_page, engine);
     unsafe {
-        SERVICE_PAGE = PhysAddr::from(comm_page);
+        if engine < 64 {
+            SERVICE_PAGES[engine] = PhysAddr::from(comm_page);
+        } else {
+            SERVICE_PAGE = PhysAddr::from(comm_page);
+        }
     };
     Ok(())
 }
@@ -138,7 +167,7 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
 
         // Map lazily and remap when the service re-registers (each
         // forwarded session starts a fresh service process).
-        let sp = unsafe { SERVICE_PAGE };
+        let sp = service_page_for(core);
         if sp != service_phys {
             service_mapping = if sp == PhysAddr::null() {
                 None

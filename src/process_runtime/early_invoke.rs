@@ -33,6 +33,7 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         guest_page_table: 0,
         invocation_arg_guest_vaddr: 0,
         invocation_arg_size: 0,
+        nested_call: false,
         return_values: ReturnValues{
             rcx: core::ptr::null_mut(),
             rdx: core::ptr::null_mut(),

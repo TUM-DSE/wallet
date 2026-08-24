@@ -10,3 +10,4 @@ pub mod request;
 pub mod inference;
 pub mod gpu;
 pub mod model;
+pub mod call;

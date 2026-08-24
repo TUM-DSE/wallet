@@ -108,6 +108,14 @@ impl TrustedProcessStore {
         -1
     }
 
+    /// Number of process slots. `get` indexes straight into the Vec,
+    /// so anything taking an id from a trustlet must bounds-check with
+    /// this first rather than panicking the monitor.
+    pub fn len(&self) -> usize {
+        let ptr = unsafe { self.processes.get().as_ref().unwrap() };
+        ptr.len()
+    }
+
     pub fn get(&self, pid: ProcessID) -> &mut TrustedProcess {
         let ptr = unsafe { self.processes.get().as_mut().unwrap() };
         &mut ptr[pid.0]

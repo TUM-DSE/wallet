@@ -71,10 +71,17 @@ impl ProcessRuntimeExit for PALContext {
     /// Copies the reuslts into the provided buffer
     fn pal_svsm_get_result(&mut self) -> ReturnTarget {
         breakdown_outb(220);
-        self.process.context.channel.copy_out(
-            self.result_addr,
-            self.guest_page_table,
-            self.result_size as usize);
+        /* Called from another trustlet: the caller shares this output
+           channel as its input channel (create_channel), so the answer
+           is already where the caller will read it. There is no guest
+           buffer to copy to - result_addr/guest_page_table are 0 and
+           copying would fault. */
+        if !self.nested_call {
+            self.process.context.channel.copy_out(
+                self.result_addr,
+                self.guest_page_table,
+                self.result_size as usize);
+        }
         self.return_values.result(TrustletReturnType::GETRESULT as u64);
         #[cfg(not(feature = "boottime"))]
         {

@@ -201,6 +201,7 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
             guest_page_table,
             invocation_arg_guest_vaddr,
             invocation_arg_size,
+            nested_call: false,
             return_values:
                 ReturnValues {
                     rcx: &mut params.rcx,

@@ -24,6 +24,7 @@ use super::process::request::ProcessRuntimeGuestRequest;
 use super::process::inference::ProcessRuntimeInference;
 use super::process::gpu::ProcessRuntimeGpu;
 use super::process::model::ProcessRuntimeModel;
+use super::process::call::ProcessRuntimeCall;
 pub use super::early_invoke::early_invoke;
 pub use super::invoke::invoke_trustlet;
 
@@ -105,6 +106,10 @@ impl ProcessRuntime for PALContext  {
 
             ProcessCallType::GpuChannel => {
                 return self.pal_svsm_gpu_channel();
+            }
+
+            ProcessCallType::CallTrustlet => {
+                return self.pal_call_trustlet();
             }
 
             ProcessCallType::ModelChannel => {
