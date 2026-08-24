@@ -46,7 +46,14 @@ impl ProcessRuntimeGpu for PALContext {
             self.vmsa.rcx = u64::from_ne_bytes((-2i64).to_ne_bytes());
             return RETURN_TO_PROCESS;
         }
-        let core = match crate::exclusive::donated_core() {
+        /* Prefer a donated core with no engine on it, so each trustlet
+           gets its own engine slot - and therefore its own service
+           process and CUDA context. With only one core donated this is
+           the same core every time, and re-registering over a dead
+           client's slot is still how crash recovery works, so the
+           single-engine behaviour is unchanged. */
+        let core = match crate::exclusive::free_donated_core()
+            .or_else(crate::exclusive::donated_core) {
             Some(c) => c,
             None => {
                 log::warn!("gpu_channel: no donated core is polling (run tools/donate first)");
@@ -54,6 +61,12 @@ impl ProcessRuntimeGpu for PALContext {
                 return RETURN_TO_PROCESS;
             }
         };
+        if !crate::gpu::direct::engine_registered(core) {
+            log::info!("gpu_channel: assigning engine slot {} (free)", core);
+        } else {
+            log::warn!("gpu_channel: no free donated core, replacing the engine \
+                        on core {} - donate one core per concurrent engine", core);
+        }
 
         let page = allocate_page();
         let (mapping, page_mapped) = paddr_as_slice!(page);
@@ -75,6 +88,9 @@ impl ProcessRuntimeGpu for PALContext {
                    page, addr, core);
 
         self.vmsa.rcx = 0;
+        /* Which engine slot this trustlet got: the service that serves
+           it must register with SERVICE_ENGINE set to the same core. */
+        self.vmsa.r8 = core as u64;
         RETURN_TO_PROCESS
     }
 }

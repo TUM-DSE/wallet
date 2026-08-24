@@ -35,7 +35,28 @@ pub static mut CONTROL: [PhysAddr; 64] = [PhysAddr::null(); 64];
 /// polling core.
 pub fn donated_core() -> Option<usize> {
     for i in 0..64 {
-        if unsafe { CONTROL[i] } != PhysAddr::null() {
+        if is_donated(i) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Is this specific core donated (running the exclusive command loop)?
+pub fn is_donated(core: usize) -> bool {
+    core < 64 && unsafe { CONTROL[core] } != PhysAddr::null()
+}
+
+/// A donated core with no engine registered on it yet.
+///
+/// One engine per donated core is what gives each engine its own
+/// service process, and therefore its own CUDA context - the only thing
+/// that actually isolates engines from each other (Stage D-0: separate
+/// contexts inside one process do not). Donate one core per engine you
+/// want to run concurrently.
+pub fn free_donated_core() -> Option<usize> {
+    for i in 0..64 {
+        if is_donated(i) && !crate::gpu::direct::engine_registered(i) {
             return Some(i);
         }
     }
