@@ -246,6 +246,23 @@ pub fn register_heap(params: &mut RequestParams) -> Result<(), MonitorError> {
         reject(params);
         return Ok(());
     }
+    /* Offset 0 resets the slot: a fresh service process registers a
+       fresh heap (vmpl.ko already dropped the old pins). Directory
+       pages are kept and overwritten. Any trustlet still holding the
+       old mapping belongs to a session whose service is gone - dead
+       either way. The mapped counters go back to zero so gpu_channel
+       and the grow hook re-map from the start. */
+    if offset == 0 {
+        unsafe {
+            if engine < 64 {
+                HEAP_NPAGES[engine] = 0;
+                HEAP_MAPPED[engine] = 0;
+            } else {
+                HEAP_NPAGES_ANY = 0;
+                for i in 0..64 { HEAP_MAPPED[i] = 0; }
+            }
+        }
+    }
     let current = unsafe {
         if engine < 64 { HEAP_NPAGES[engine] } else { HEAP_NPAGES_ANY }
     } as usize;
