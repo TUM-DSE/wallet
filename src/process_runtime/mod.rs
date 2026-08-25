@@ -60,6 +60,20 @@ pub struct PALContext {
     return_values: ReturnValues,
 }
 
+impl PALContext {
+    /// Mark this process dead and release the monitor resources tied
+    /// to it - its GPU engine slot today. Every give-up path (exit,
+    /// PAL error, unhandled fault) goes through here so a dead session
+    /// never squats on a donated core.
+    pub(crate) fn mark_dead(&mut self) {
+        self.process.dead = true;
+        if self.process.gpu_core >= 0 {
+            crate::gpu::direct::free_engine_slot(self.process.gpu_core as usize);
+            self.process.gpu_core = -1;
+        }
+    }
+}
+
 /// Return value to the guest from invokeTrustlet
 #[derive(Debug,Clone,Copy,Eq,PartialEq,TryFromPrimitive)]
 #[repr(u64)]

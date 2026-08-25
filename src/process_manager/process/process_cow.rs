@@ -101,6 +101,7 @@ impl TrustedProcess {
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
             dead: false,
+            gpu_core: -1,
             infer_context: AllocationRange(0,0),
         }
     }

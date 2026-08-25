@@ -60,7 +60,7 @@ impl ProcessRuntimeGpu for PALContext {
            client's slot is still how crash recovery works, so the
            single-engine behaviour is unchanged. */
         let core = match crate::exclusive::free_donated_core()
-            .or_else(crate::exclusive::donated_core) {
+            .or_else(crate::exclusive::replacement_donated_core) {
             Some(c) => c,
             None => {
                 log::warn!("gpu_channel: no donated core is polling (run tools/donate first)");
@@ -95,6 +95,10 @@ impl ProcessRuntimeGpu for PALContext {
            rather than having the payload copied through the comm page. */
         crate::gpu::direct::register_engine_page(
             core, page, PhysAddr::from(self.vmsa.cr3));
+        /* Remember the slot so death (exit/fault) can free it - a dead
+           session's registration otherwise squats on the donated core
+           until another session replaces it. */
+        self.process.gpu_core = core as i64;
         log::warn!("gpu_channel: comm page {:#x?} mapped at {:#x}, polled by core {}",
                    page, addr, core);
 

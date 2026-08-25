@@ -397,6 +397,22 @@ pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
     Ok(())
 }
 
+/// Release `core`'s engine slot: the poller sees the null page on its
+/// next iteration and goes idle, and free_donated_core can hand the
+/// core to the next session. Called when the owning trustlet dies -
+/// before this, dead sessions squatted on their cores and concurrent
+/// new sessions were forced into the replacement fallback.
+pub fn free_engine_slot(core: usize) {
+    if core >= 64 {
+        return;
+    }
+    unsafe {
+        ENGINE_PAGES[core] = PhysAddr::null();
+        HEAP_MAPPED[core] = 0;
+    }
+    log::warn!("engine slot {} freed (owner died)", core);
+}
+
 /// True when a client comm page is registered for `core`. Used by the
 /// donated-core command loop to decide when to enter `poll_engine`.
 pub fn engine_registered(core: usize) -> bool {

@@ -173,6 +173,10 @@ pub struct TrustedProcess {
     /// then read as a guest-request code, which retries forever -
     /// observed 2026-08-25, see PLAN.md).
     pub dead: bool,
+    /// GPU engine slot (donated core) this trustlet registered via
+    /// gpu_channel; -1 = none. Freed when the trustlet dies so the
+    /// core is reusable without the replacement fallback.
+    pub gpu_core: i64,
 }
 
 impl ProcessBaseContext {
@@ -237,6 +241,7 @@ impl TrustedProcess {
             pf_target_vaddr: 0,
             infer_context: inf,
             dead: false,
+            gpu_core: -1,
         }
 
     }
@@ -279,6 +284,7 @@ impl TrustedProcess {
             pf_target_vaddr: 0,
             infer_context: AllocationRange(0,0),
             dead: false,
+            gpu_core: -1,
         }
     }
 }

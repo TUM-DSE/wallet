@@ -47,7 +47,7 @@ impl ProcessRuntimeExit for PALContext {
            without setting a result the guest sees leftover input in
            rcx, which can alias a guest-request code and retry into
            this dead context forever. */
-        self.process.dead = true;
+        self.mark_dead();
         self.return_values.result(TrustletReturnType::ERROR as u64);
         RETURN_TO_GUEST
     }
@@ -65,7 +65,7 @@ impl ProcessRuntimeExit for PALContext {
         log::info!(" [Trustlet] Exit with Status Code: {}", exit_code);
         /* An exited context must never be resumed: the VMSA is past
            its exit, and re-entering it #GPs on garbage state. */
-        self.process.dead = true;
+        self.mark_dead();
         self.return_values.result(TrustletReturnType::EXIT as u64);
         // Binary-entrypoint trustlets have no result channel; their
         // exit status IS the result. rdx lands in the guest's

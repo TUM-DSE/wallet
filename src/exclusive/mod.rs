@@ -47,6 +47,39 @@ pub fn is_donated(core: usize) -> bool {
     core < 64 && unsafe { CONTROL[core] } != PhysAddr::null()
 }
 
+/// A donated core to REPLACE when no free one exists, rotating over
+/// the donated cores. Before this, every new trustlet arriving with
+/// all slots dirty landed on the FIRST donated core - two concurrent
+/// engines then shared one slot, the second replacing the first's comm
+/// page, and the first session died (Phase 0 root cause, PLAN.md).
+/// Rotation keeps concurrent engines on distinct cores even when every
+/// slot holds a dead session's registration.
+static NEXT_REPLACEMENT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn replacement_donated_core() -> Option<usize> {
+    let mut n = 0;
+    for i in 0..64 {
+        if is_donated(i) {
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let k = NEXT_REPLACEMENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % n;
+    let mut seen = 0;
+    for i in 0..64 {
+        if is_donated(i) {
+            if seen == k {
+                return Some(i);
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
 /// A donated core with no engine registered on it yet.
 ///
 /// One engine per donated core is what gives each engine its own
