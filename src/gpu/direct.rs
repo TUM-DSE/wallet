@@ -4,6 +4,10 @@ use core::sync::atomic::{AtomicU8, AtomicU32};
 use core::sync::atomic::Ordering;
 use crate::address::PhysAddr;
 use crate::address::VirtAddr;
+use crate::process_manager::process_memory::allocate_page;
+use crate::sev::{rmp_adjust, RMPFlags};
+use crate::types::PageSize;
+use crate::paddr_as_slice;
 use crate::process_manager::process_paging::ProcessPageTableRef;
 extern "Rust" {
     fn wallet_get_apic_id() -> u32;
@@ -263,6 +267,8 @@ pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
 pub const BULK_MEMCPY: u64 = 700;
 const MEMCPY_ID: u32 = 121;
 const PAGE_SIZE: usize = 4096;
+/// Recognisable fill for the VMPL2 share spike page, as u64 lanes.
+const SHARE_SPIKE_PATTERN: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 const MEMCPY_HDR: usize = 32;
 const MEMCPY_MAX_PAYLOAD: usize = COMM_DATA_SIZE - MEMCPY_HDR;
 
