@@ -249,10 +249,6 @@ impl ProcessMemConfig{
 
         let (_mapping, a) = paddr_as_u64_slice!(tmp);
         a.fill(0);
-        /* F5 instrumentation (PLAN.md): recycled pages keep whatever
-           RMP grants their previous owner left. Log every reuse so a
-           failing allocation can be correlated with its history. */
-        log::warn!("[page] RECYCLED {:#x}", u64::from(tmp));
         tmp
     }
 
