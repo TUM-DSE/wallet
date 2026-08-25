@@ -48,6 +48,14 @@ impl ProcessRuntimeException for PALContext {
                 log::info!("vmsa rsp: {:?}", rsp);
                 log::info!("vmsa rdi: {:?}", rdi);
                 log::info!("Unhandled #GP");
+                /* Give the guest a defined failure and refuse future
+                   resumes. Before this, the un-set return values left
+                   the guest's own input in rcx - which can alias a
+                   guest-request code (3 = fileattr was observed) and
+                   send the guest into an endless retry-and-#GP loop
+                   that floods the console and wedges the VM. */
+                self.process.dead = true;
+                self.return_values.result(TrustletReturnType::ERROR as u64);
                 return RETURN_TO_GUEST;
             }
             14 => {
@@ -171,6 +179,10 @@ impl ProcessRuntimeException for PALContext {
                 if error_code & PF_INSTRUCTION != 0 {
                     log::info!("[Trustlet] Page fault: instruction fetch");
                 }
+                /* Same contract as the #GP arm: unhandled means dead,
+                   and dead means a defined ERROR to the guest. */
+                self.process.dead = true;
+                self.return_values.result(TrustletReturnType::ERROR as u64);
                 RETURN_TO_GUEST
             }
             _ => {
@@ -285,6 +297,9 @@ impl ProcessRuntimeException for PALContext {
         log::info!(" [Trustlet] ds: {:?}", ds);
 
         log::info!(" [Trustlet] ---------------------------------");
+        /* A double fault is as dead as it gets. */
+        self.process.dead = true;
+        self.return_values.result(TrustletReturnType::ERROR as u64);
         RETURN_TO_GUEST
     }
 }

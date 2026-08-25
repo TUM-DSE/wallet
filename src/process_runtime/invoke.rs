@@ -45,6 +45,31 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     let id = params.rcx;
 
+    /* Refuse to resume anything that cannot be resumed - out-of-range
+       or unoccupied ids (the id comes from the guest; get() would
+       panic the monitor), and processes marked dead by the exit and
+       exception paths. Resuming an exited/faulted VMSA #GPs on garbage
+       state, and before the return values were defined on those paths
+       the guest would read a leftover value as a guest-request code
+       and retry the dead trustlet forever, wedging the VM (observed
+       2026-08-25, PLAN.md). */
+    if id as usize >= PROCESS_STORE.len() {
+        log::warn!("invoke_trustlet: id {} out of range", id);
+        params.rcx = super::TrustletReturnType::ERROR as u64;
+        return Ok(());
+    }
+    {
+        let target = PROCESS_STORE.get(ProcessID(id as usize));
+        if target.process_type != crate::process_manager::process::TrustedProcessType::Trustlet
+            || target.dead {
+            log::warn!("invoke_trustlet: refusing to resume trustlet {} ({})",
+                       id,
+                       if target.dead { "exited or faulted" } else { "not a trustlet" });
+            params.rcx = super::TrustletReturnType::ERROR as u64;
+            return Ok(());
+        }
+    }
+
     // Get the invoke_data given from the guest
     // The structure of the invoke_data is as follows:
     // struct data {

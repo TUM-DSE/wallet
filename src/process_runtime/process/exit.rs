@@ -42,6 +42,13 @@ impl ProcessRuntimeExit for PALContext {
         let s = unsafe { CStr::from_ptr(c_string) };
 
         log::info!(" [Trustlet] PAL Error: {} {}",s.to_str().unwrap(), errno);
+        /* The PAL gave up: nothing sane can be resumed after this.
+           Mark the process dead and hand the guest a defined ERROR -
+           without setting a result the guest sees leftover input in
+           rcx, which can alias a guest-request code and retry into
+           this dead context forever. */
+        self.process.dead = true;
+        self.return_values.result(TrustletReturnType::ERROR as u64);
         RETURN_TO_GUEST
     }
     /// Exit the trustlet
@@ -56,6 +63,9 @@ impl ProcessRuntimeExit for PALContext {
         // PAL exits, exit the trustlet
         let exit_code = self.vmsa.rbx;
         log::info!(" [Trustlet] Exit with Status Code: {}", exit_code);
+        /* An exited context must never be resumed: the VMSA is past
+           its exit, and re-entering it #GPs on garbage state. */
+        self.process.dead = true;
         self.return_values.result(TrustletReturnType::EXIT as u64);
         // Binary-entrypoint trustlets have no result channel; their
         // exit status IS the result. rdx lands in the guest's

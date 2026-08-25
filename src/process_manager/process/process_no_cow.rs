@@ -91,6 +91,7 @@ impl TrustedProcess {
             context: ProcessContext::default(),
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
+            dead: false,
         }
     }
 

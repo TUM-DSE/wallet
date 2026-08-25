@@ -166,6 +166,13 @@ pub struct TrustedProcess {
     pub mmap_manager: MmapManager,
     pub pf_target_vaddr: u64,
     pub infer_context: AllocationRange,
+    /// Set when the trustlet is gone for good - it exited, hit a PAL
+    /// error, or took an exception the monitor could not handle.
+    /// invoke_trustlet refuses to resume it (resuming an exited
+    /// context #GPs on garbage state, and the un-set return values
+    /// then read as a guest-request code, which retries forever -
+    /// observed 2026-08-25, see PLAN.md).
+    pub dead: bool,
 }
 
 impl ProcessBaseContext {
@@ -229,6 +236,7 @@ impl TrustedProcess {
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
             infer_context: inf,
+            dead: false,
         }
 
     }
@@ -270,6 +278,7 @@ impl TrustedProcess {
             mmap_manager: MmapManager::new(),
             pf_target_vaddr: 0,
             infer_context: AllocationRange(0,0),
+            dead: false,
         }
     }
 }

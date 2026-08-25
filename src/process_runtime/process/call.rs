@@ -84,6 +84,12 @@ pub fn run_nested(ctx: &mut PALContext, callee_id: u64) -> i64 {
             log::warn!("call_trustlet: {} is not a trustlet", callee_id);
             return -1;
         }
+        if callee.dead {
+            /* Same contract as invoke_trustlet: an exited/faulted
+               callee cannot be resumed. */
+            log::warn!("call_trustlet: {} has exited or faulted", callee_id);
+            return -1;
+        }
 
         let depth = unsafe { CALL_DEPTH };
         if depth >= MAX_CALL_DEPTH {
