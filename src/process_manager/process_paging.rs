@@ -1166,8 +1166,7 @@ impl ProcessPageTableRef {
                                 for i in 0..512 {
                                     new_data[i] = pud_table[i];
                                 }
-                                let flags = (pud.flags().bits() | ProcessPageFlags::WRITABLE.bits())
-                                    & !ProcessPageFlags::COPY_ON_WRITE.bits();
+                                let flags = pud.flags().bits() | ProcessPageFlags::WRITABLE.bits() & !ProcessPageFlags::COPY_ON_WRITE.bits();
                                 pgd_table[pgd_idx].set(new_page, ProcessPageFlags::from_bits_truncate(flags));
                                 (_pud_mapping, pud_table) = paddr_as_table!(strip_paddr!(pgd_table[pgd_idx].0));
                             }
@@ -1179,8 +1178,7 @@ impl ProcessPageTableRef {
                                 for i in 0..512 {
                                     new_data[i] = pmd_table[i];
                                 }
-                                let flags = (pmd.flags().bits() | ProcessPageFlags::WRITABLE.bits())
-                                    & !ProcessPageFlags::COPY_ON_WRITE.bits();
+                                let flags = pmd.flags().bits() | ProcessPageFlags::WRITABLE.bits() & !ProcessPageFlags::COPY_ON_WRITE.bits();
                                 pud_table[pud_idx].set(new_page, ProcessPageFlags::from_bits_truncate(flags));
                                 (_pmd_mapping, pmd_table) = paddr_as_table!(strip_paddr!(pud_table[pud_idx].0));
                             }
@@ -1192,24 +1190,12 @@ impl ProcessPageTableRef {
                                 for i in 0..512 {
                                     new_data[i] = pte_table[i];
                                 }
-                                /* Was pmd.flags() - the level ABOVE this one
-                                   (the naming in this function is shifted:
-                                   `pte` is the PMD entry being replaced). */
-                                let flags = (pte.flags().bits() | ProcessPageFlags::WRITABLE.bits())
-                                    & !ProcessPageFlags::COPY_ON_WRITE.bits();
+                                let flags = pmd.flags().bits() | ProcessPageFlags::WRITABLE.bits() & !ProcessPageFlags::COPY_ON_WRITE.bits();
                                 pmd_table[pmd_idx].set(new_page, ProcessPageFlags::from_bits_truncate(flags));
                                 (_pte_mapping, pte_table) = paddr_as_table!(strip_paddr!(pmd_table[pmd_idx].0));
                             }
                         }
-                        /* Precedence bug until 2026-08-25: `a | b & !c` parses as
-                           `a | (b & !c)`, and WRITABLE (bit 1) and COPY_ON_WRITE
-                           (bit 9) are disjoint, so the CoW bit was NEVER cleared
-                           on any of the four levels. Every later write fault on
-                           the same page therefore re-broke it, allocating a fresh
-                           page (and up to three table pages) each time - the
-                           unbounded monitor memory growth in PLAN.md. */
-                        let flag = (page.flags().bits() | ProcessPageFlags::WRITABLE.bits())
-                            & !ProcessPageFlags::COPY_ON_WRITE.bits();
+                        let flag = page.flags().bits() | ProcessPageFlags::WRITABLE.bits() & !ProcessPageFlags::COPY_ON_WRITE.bits();
                         pte_table[pte_idx].set(new_page, ProcessPageFlags::from_bits_truncate(flag));
                         return true;
                     }
