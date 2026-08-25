@@ -1107,6 +1107,18 @@ impl ProcessPageTableRef {
         }
     }
 
+    /// Phase-0 instrumentation (PLAN.md burn-in plan): log the PML4
+    /// slots the monitor writes after cloning - 5/6 (channels),
+    /// 8 (model store), 9 (GPU comm/window/heap). Called at clone, at
+    /// gpu_channel, and from the unhandled-fault paths, so a lost
+    /// mapping shows WHEN it was lost with three console lines.
+    pub fn log_pml4_slots(&self, tag: &str) {
+        let (_m, t) = paddr_as_u64_slice!(self.process_page_table);
+        log::warn!("[pml4:{}] cr3={:#x} [5]={:#x} [6]={:#x} [8]={:#x} [9]={:#x}",
+                   tag, u64::from(self.process_page_table),
+                   t[5], t[6], t[8], t[9]);
+    }
+
     pub fn handle_cow(&mut self, addr: VirtAddr, user_access: bool) -> bool {
         // Handle CoW for the page at the given address
         // including the pagetable

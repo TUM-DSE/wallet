@@ -21,8 +21,16 @@ use crate::vaddr_as_slice;
 use crate::process_manager::PROCESS_STORE;
 use crate::process_manager::process::ProcessID;
 use num_enum::TryFromPrimitive;
+use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use super::PALContext;
+
+/// Phase-0 concurrency canary (PLAN.md burn-in plan): the monitor has
+/// no locking around invoke state, and both RIP-0x8 panics plausibly
+/// had two invokes in flight. Counts concurrent invoke_trustlet
+/// entries and warns loudly when there is more than one - evidence,
+/// not protection.
+static INVOKES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 use super::runtime::ProcessRuntime;
 use super::runtime::TRUSTLET_VMPL;
 
@@ -117,6 +125,13 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
     log::debug!("{:x?}", p2[0]);
 
     //panic!();*/
+
+    let in_flight = INVOKES_IN_FLIGHT.fetch_add(1, AtomicOrdering::SeqCst);
+    if in_flight > 0 {
+        log::warn!("invoke_trustlet: {} invoke(s) already in flight - \
+                    entering for trustlet {} anyway (canary, not a guard)",
+                   in_flight, id);
+    }
 
     // Getting the current processes VMSA
     let vmsa_paddr = trustlet.context.vmsa;
@@ -249,6 +264,7 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
         }
     }
     //params.rcx = rc.return_value;
+    INVOKES_IN_FLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
     breakdown_outb(214);
     Ok(())
 }

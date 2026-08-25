@@ -156,6 +156,10 @@ impl ProcessRuntimeGpu for PALContext {
                        crate::gpu::direct::GPU_HEAP_VADDR, self.vmsa.rbx >> 10);
         }
 
+        /* Phase-0 instrumentation: state of the monitor-managed PML4
+           slots after everything gpu_channel just mapped. */
+        page_table_ref.log_pml4_slots("gpu_channel");
+
         self.vmsa.rcx = 0;
         /* Which engine slot this trustlet got: the service that serves
            it must register with SERVICE_ENGINE set to the same core. */

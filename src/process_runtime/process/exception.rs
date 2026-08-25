@@ -179,6 +179,13 @@ impl ProcessRuntimeException for PALContext {
                 if error_code & PF_INSTRUCTION != 0 {
                     log::info!("[Trustlet] Page fault: instruction fetch");
                 }
+                /* Phase-0 instrumentation: which monitor-managed PML4
+                   slots does the faulting trustlet still have? */
+                {
+                    let mut ptr = ProcessPageTableRef::default();
+                    ptr.set_external_table(self.vmsa.cr3);
+                    ptr.log_pml4_slots("unhandled-pf");
+                }
                 /* Same contract as the #GP arm: unhandled means dead,
                    and dead means a defined ERROR to the guest. */
                 self.process.dead = true;

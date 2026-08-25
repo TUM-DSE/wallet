@@ -151,7 +151,10 @@ pub fn get_undo(params: &mut RequestParams, store: &Store<StoreEntry>) -> Result
         return Ok(())
     }
     let (_map, page_table) = paddr_as_slice!(guest_pgd.into());
-    page_table[guest_pgd_idx] = e.data.0;
+    /* Copy-paste bug until 2026-08-25: this wrote e.data.0 (the same
+       entry `get` installs), so "undo" RE-mapped the store instead of
+       unmapping it. Clear the slot. */
+    page_table[guest_pgd_idx] = 0;
     params.rcx = e.real_size;
 
     Ok(())

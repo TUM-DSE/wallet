@@ -314,6 +314,7 @@ impl ProcessContext {
         let mut new_page_table_ref = ProcessPageTableRef::default();
         new_page_table_ref.init_vmpl1();
         new_page_table_ref.copy_pgd(&zygote_context.page_table_ref);
+        new_page_table_ref.log_pml4_slots("clone");
         let page_table_ref = new_page_table_ref;
 
         //Creating new VMSA for the Process
