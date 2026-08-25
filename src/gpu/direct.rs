@@ -319,6 +319,27 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
         || id == C::CUDA_API_CALL_cudaStreamSynchronize.0 {
         // req: u64 handle; resp: i32 err
         Some((8, 4))
+    } else if id == C::CUDA_API_CALL_cudaStreamBeginCapture.0 {
+        // req: u64 stream, u32 mode; resp: i32 err
+        Some((12, 4))
+    } else if id == C::CUDA_API_CALL_cudaStreamEndCapture.0
+        || id == C::CUDA_API_CALL_cudaGraphInstantiate.0 {
+        // req: u64 (stream / graph); resp: i32 err @0, u64 handle @8.
+        // Graphs and execs are opaque u64 tokens, same convention as
+        // streams and cuBLAS handles: the value is the service's own
+        // pointer, meaningless to the client except as a token.
+        Some((8, 16))
+    } else if id == C::CUDA_API_CALL_cudaGraphExecUpdate.0 {
+        // req: u64 exec, u64 graph; resp: i32 err @0, u32 result @4
+        Some((16, 8))
+    } else if id == C::CUDA_API_CALL_cudaGraphLaunch.0 {
+        // req: u64 exec, u64 stream; resp: i32 err. The hot one: this
+        // single relay replaces a whole token's kernel launches.
+        Some((16, 4))
+    } else if id == C::CUDA_API_CALL_cudaGraphDestroy.0
+        || id == C::CUDA_API_CALL_cudaGraphExecDestroy.0 {
+        // req: u64 handle; resp: i32 err
+        Some((8, 4))
     } else if id == CUBLAS_CREATE {
         // resp: i32 status @0, u64 handle token @8
         Some((0, 16))
