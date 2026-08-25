@@ -5,9 +5,9 @@ use core::sync::atomic::Ordering;
 use crate::address::PhysAddr;
 use crate::address::VirtAddr;
 use crate::process_manager::process_memory::allocate_page;
-use crate::sev::{rmp_adjust, RMPFlags};
-use crate::types::PageSize;
 use crate::paddr_as_slice;
+use crate::map_paddr;
+use crate::vaddr_as_slice;
 use crate::process_manager::process_paging::ProcessPageTableRef;
 extern "Rust" {
     fn wallet_get_apic_id() -> u32;
@@ -79,6 +79,88 @@ pub fn register_service(params: &mut RequestParams) -> Result<(), MonitorError> 
        "gpu_service_setup_call failed" whenever that address happens to
        have bit 31 set. Registration then succeeds or fails depending on
        where the page landed in physical memory. */
+    params.rcx = 0;
+    Ok(())
+}
+
+/// Shared staging window (approach B, see PLAN.md): a few hundred KiB
+/// of ordinary SERVICE memory, pinned by vmpl.ko and registered here as
+/// a physical page list. The monitor maps the same pages into the
+/// trustlet (VMPL1|RW) when the trustlet requests its GPU channel, so
+/// large memcpy payloads travel client -> window -> cudaMemcpy with no
+/// monitor copying and one comm-page round trip per windowful instead
+/// of per 4056 bytes. Guest-side clients map the very same pages via
+/// vmpl.ko's mmap handler instead - no monitor involvement at all.
+///
+/// The window is guest memory and stays fully VMPL2-accessible: it
+/// carries data the service was going to see anyway (everything the
+/// relay forwards to the GPU is already plaintext to the guest), so
+/// sharing it costs no confidentiality the relay ever provided.
+pub const GPU_WINDOW_MAX_PAGES: usize = 512; // list must fit one page
+
+/// Per-engine window page lists (monitor-owned copies), indexed like
+/// SERVICE_PAGES, plus the legacy any-engine fallback slot.
+static mut WINDOW_LISTS: [PhysAddr; 64] = [PhysAddr::null(); 64];
+static mut WINDOW_NPAGES: [u64; 64] = [0; 64];
+static mut WINDOW_LIST_ANY: PhysAddr = PhysAddr::null();
+static mut WINDOW_NPAGES_ANY: u64 = 0;
+
+/// Which window serves `core`: its own if one registered, otherwise
+/// the shared fallback. Returns the monitor-owned list page and the
+/// number of valid entries (0 = no window).
+pub fn window_for(core: usize) -> (PhysAddr, usize) {
+    unsafe {
+        if core < 64 && WINDOW_LISTS[core] != PhysAddr::null()
+            && WINDOW_NPAGES[core] != 0 {
+            return (WINDOW_LISTS[core], WINDOW_NPAGES[core] as usize);
+        }
+        (WINDOW_LIST_ANY, WINDOW_NPAGES_ANY as usize)
+    }
+}
+
+pub fn register_window(params: &mut RequestParams) -> Result<(), MonitorError> {
+    // Args:
+    //  rcx: phys address of a page holding the window's physical page
+    //       list (u64 per page, vmpl.ko-pinned service memory)
+    //  rdx: number of pages in the list
+    //  r8:  engine this window belongs to (>= 64 = any, like services)
+    // Returns (rcx): 0 ok, -1 bad arguments.
+    let list_phys = PhysAddr::from(params.rcx);
+    let npages = params.rdx as usize;
+    let engine = params.r8 as usize;
+    if list_phys == PhysAddr::null() || npages == 0 || npages > GPU_WINDOW_MAX_PAGES {
+        log::warn!("GPU window registration rejected: list {:#x?}, {} pages",
+                   list_phys, npages);
+        params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
+        return Ok(());
+    }
+    /* Copy the list into a monitor-owned page: the trustlet mapping
+       happens later (gpu_channel), and it must see the registration-
+       time list, not whatever the guest wrote in between. The page is
+       reused across re-registrations (fresh service per session), so
+       it is one page per engine slot for the monitor's lifetime. */
+    let slot = unsafe {
+        if engine < 64 { WINDOW_LISTS[engine] } else { WINDOW_LIST_ANY }
+    };
+    let copy = if slot == PhysAddr::null() { allocate_page() } else { slot };
+    {
+        let (_guest_mapping, guest_list) = paddr_as_slice!(list_phys);
+        let (_copy_mapping, copy_list) = paddr_as_slice!(copy);
+        for i in 0..npages {
+            copy_list[i] = guest_list[i];
+        }
+    }
+    unsafe {
+        if engine < 64 {
+            WINDOW_LISTS[engine] = copy;
+            WINDOW_NPAGES[engine] = npages as u64;
+        } else {
+            WINDOW_LIST_ANY = copy;
+            WINDOW_NPAGES_ANY = npages as u64;
+        }
+    }
+    log::warn!("GPU window registration: {} pages ({} KiB), engine {}",
+               npages, npages * 4, engine);
     params.rcx = 0;
     Ok(())
 }
@@ -265,10 +347,13 @@ pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
 /// Bulk memcpy id, outside the cudart enumeration like the cuBLAS
 /// range. One of these replaces ceil(count/4056) per-chunk calls.
 pub const BULK_MEMCPY: u64 = 700;
+/// Windowed memcpy (approach B): the payload travels through a staging
+/// window the service donated and the monitor mapped into the client at
+/// registration time. The comm page only carries a 28-byte descriptor
+/// per windowful; the monitor copies nothing.
+pub const WINDOW_MEMCPY: u64 = 701;
 const MEMCPY_ID: u32 = 121;
 const PAGE_SIZE: usize = 4096;
-/// Recognisable fill for the VMPL2 share spike page, as u64 lanes.
-const SHARE_SPIKE_PATTERN: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 const MEMCPY_HDR: usize = 32;
 const MEMCPY_MAX_PAYLOAD: usize = COMM_DATA_SIZE - MEMCPY_HDR;
 
@@ -384,6 +469,12 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
         // req: 144-byte fixed header (scalars + device pointers +
         // inline 16-byte alpha/beta slots); resp: i32 status
         Some((144, 4))
+    } else if id == WINDOW_MEMCPY {
+        // req: u64 device ptr, u64 count, u64 window offset, i32 kind;
+        // resp: i32 err. The payload travels through the shared staging
+        // window (mapped into client and service alike), NOT the comm
+        // page - this descriptor is all the monitor relays.
+        Some((28, 4))
     } else if id == C::CUDA_API_CALL_cudaMemcpy.0 {
         // header: u64 dst, u64 src, u64 count, int32 kind; the payload
         // direction depends on kind. Clamped to the page capacity — the

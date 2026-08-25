@@ -186,6 +186,8 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
             crate::exclusive::scheduling::run_exit(params),
         MonitorCallType::RegisterCpuClient =>
             crate::gpu::direct::register_service(params),
+        MonitorCallType::RegisterGpuWindow =>
+            crate::gpu::direct::register_window(params),
         _ => Err(MonitorError::unsupported()),
     };
 

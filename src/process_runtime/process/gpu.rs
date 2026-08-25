@@ -14,6 +14,12 @@ use crate::memory::paging::PerCPUPageMappingGuard;
 
 use super::super::PALContext;
 
+/// Where the shared staging window lands in the trustlet: same PML4
+/// slot as the comm page (9 - see redirect/filter.py for the slot
+/// map), 2 MiB above it so the comm page's PMD entry is not shared
+/// with the window's and there is room for the largest window.
+pub const GPU_WINDOW_VADDR: u64 = 0x48000200000;
+
 pub trait ProcessRuntimeGpu {
     fn pal_svsm_gpu_channel(&mut self) -> ReturnTarget;
 }
@@ -91,6 +97,52 @@ impl ProcessRuntimeGpu for PALContext {
             core, page, PhysAddr::from(self.vmsa.cr3));
         log::warn!("gpu_channel: comm page {:#x?} mapped at {:#x}, polled by core {}",
                    page, addr, core);
+
+        /* Approach B: if the service registered a staging window for
+           this engine, grant the trustlet VMPL1|RW on its pages and map
+           them at GPU_WINDOW_VADDR. The window is pinned SERVICE memory
+           (guest-owned; VMPL2 keeps its access - by design, the service
+           must read what the client stages), so large memcpy payloads
+           can travel through it with one descriptor per windowful
+           instead of one comm-page round trip per 4056 bytes. r9 tells
+           the client how many bytes are mapped; 0 = no window, client
+           stays on the chunked path. */
+        let (wlist, wpages) = crate::gpu::direct::window_for(core);
+        let mut window_bytes: u64 = 0;
+        if wlist != PhysAddr::null() && wpages > 0 {
+            let (_list_mapping, list) = paddr_as_slice!(wlist);
+            let mut mapped: usize = 0;
+            for i in 0..wpages {
+                let phys = PhysAddr::from(list[i]);
+                if phys == PhysAddr::null() {
+                    break;
+                }
+                let guard = match PerCPUPageMappingGuard::create_4k(phys) {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                if rmp_adjust(guard.virt_addr(),
+                              RMPFlags::VMPL1 | RMPFlags::READ | RMPFlags::WRITE,
+                              PageSize::Regular).is_err() {
+                    break;
+                }
+                page_table_ref.map_4k_page(
+                    VirtAddr::from(GPU_WINDOW_VADDR + (i as u64) * 4096),
+                    phys, flags);
+                mapped += 1;
+            }
+            if mapped == wpages {
+                window_bytes = (wpages as u64) * 4096;
+                log::warn!("gpu_channel: staging window mapped at {:#x} ({} KiB)",
+                           GPU_WINDOW_VADDR, wpages * 4);
+            } else {
+                /* Partial mappings are not exposed: the client would
+                   fault at the first unmapped page mid-copy. */
+                log::warn!("gpu_channel: window mapping failed at page {}/{} - \
+                            window not exposed", mapped, wpages);
+            }
+        }
+        self.vmsa.r9 = window_bytes;
 
         self.vmsa.rcx = 0;
         /* Which engine slot this trustlet got: the service that serves
