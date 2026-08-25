@@ -434,10 +434,21 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
     let mut page_table_ref = ProcessPageTableRef::default();
     page_table_ref.set_external_table(u64::from(table));
 
+    /* Which side is the client's host buffer depends on direction: the
+       source for H2D, the destination for D2H. Walking `src` in both
+       directions means walking a DEVICE pointer for D2H, which is not
+       in the client's page table - it fails with invalid-value while
+       H2D quietly works. */
+    let (host_base, dev_base) = if kind == MEMCPY_HOST_TO_DEVICE {
+        (src, dst)
+    } else {
+        (dst, src)
+    };
+
     let mut done: u64 = 0;
     let mut err: i32 = 0;
     while done < count {
-        let vaddr = src + done;
+        let vaddr = host_base + done;
         let page_off = (vaddr & 0xFFF) as usize;
         let in_page = (PAGE_SIZE - page_off) as u64;
         let chunk = core::cmp::min(
@@ -459,9 +470,17 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
         };
 
         // Same 32-byte header the per-call memcpy path uses, so the
-        // service needs no new dispatch arm.
-        service.data[0..8].copy_from_slice(&(dst + done).to_le_bytes());
-        service.data[8..16].copy_from_slice(&(src + done).to_le_bytes());
+        // service needs no new dispatch arm. It reads dst for H2D and
+        // src for D2H; the unused side carries the host address, which
+        // it ignores.
+        let dev_addr = dev_base + done;
+        if kind == MEMCPY_HOST_TO_DEVICE {
+            service.data[0..8].copy_from_slice(&dev_addr.to_le_bytes());
+            service.data[8..16].copy_from_slice(&vaddr.to_le_bytes());
+        } else {
+            service.data[0..8].copy_from_slice(&vaddr.to_le_bytes());
+            service.data[8..16].copy_from_slice(&dev_addr.to_le_bytes());
+        }
         service.data[16..24].copy_from_slice(&(chunk as u64).to_le_bytes());
         service.data[24..28].copy_from_slice(&kind.to_le_bytes());
 
