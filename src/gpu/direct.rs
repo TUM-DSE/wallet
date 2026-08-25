@@ -448,45 +448,55 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
     let mut done: u64 = 0;
     let mut err: i32 = 0;
     while done < count {
-        let vaddr = host_base + done;
-        let page_off = (vaddr & 0xFFF) as usize;
-        let in_page = (PAGE_SIZE - page_off) as u64;
-        let chunk = core::cmp::min(
-            core::cmp::min(in_page, count - done),
-            MEMCPY_MAX_PAYLOAD as u64) as usize;
+        // Message size is the payload cap, NOT "to the end of this
+        // page". Clamping to both meant a page-aligned buffer produced
+        // an alternating 4056 + 40 pattern - two messages per page,
+        // double the round trips, each paying its own page-table walk.
+        // A message may therefore span two source pages, which is
+        // handled by copying it in per-page pieces.
+        let chunk = core::cmp::min(count - done, MEMCPY_MAX_PAYLOAD as u64) as usize;
 
-        let phys = page_table_ref.get_page_4k_hugeaware(VirtAddr::from(vaddr));
-        if phys == PhysAddr::null() {
-            log::warn!("bulk_memcpy: client vaddr {:#x} not mapped", vaddr);
-            return CUDA_ERROR_INVALID_VALUE;
-        }
-        let mapping = match PerCPUPageMappingGuard::create_4k(phys) {
-            Ok(m) => m,
-            Err(_) => return CUDA_ERROR_INVALID_VALUE,
-        };
-        let client_page = unsafe {
-            core::slice::from_raw_parts_mut(
-                mapping.virt_addr().as_mut_ptr::<u8>(), PAGE_SIZE)
-        };
-
-        // Same 32-byte header the per-call memcpy path uses, so the
-        // service needs no new dispatch arm. It reads dst for H2D and
-        // src for D2H; the unused side carries the host address, which
-        // it ignores.
         let dev_addr = dev_base + done;
+        let host_addr = host_base + done;
         if kind == MEMCPY_HOST_TO_DEVICE {
             service.data[0..8].copy_from_slice(&dev_addr.to_le_bytes());
-            service.data[8..16].copy_from_slice(&vaddr.to_le_bytes());
+            service.data[8..16].copy_from_slice(&host_addr.to_le_bytes());
         } else {
-            service.data[0..8].copy_from_slice(&vaddr.to_le_bytes());
+            service.data[0..8].copy_from_slice(&host_addr.to_le_bytes());
             service.data[8..16].copy_from_slice(&dev_addr.to_le_bytes());
         }
         service.data[16..24].copy_from_slice(&(chunk as u64).to_le_bytes());
         service.data[24..28].copy_from_slice(&kind.to_le_bytes());
 
-        if kind == MEMCPY_HOST_TO_DEVICE {
-            service.data[MEMCPY_HDR..MEMCPY_HDR + chunk]
-                .copy_from_slice(&client_page[page_off..page_off + chunk]);
+        // Gather (H2D) or scatter (D2H) across however many source
+        // pages this message touches - at most two.
+        let mut filled: usize = 0;
+        while filled < chunk {
+            let va = host_addr + filled as u64;
+            let page_off = (va & 0xFFF) as usize;
+            let take = core::cmp::min(PAGE_SIZE - page_off, chunk - filled);
+
+            let phys = page_table_ref.get_page_4k_hugeaware(VirtAddr::from(va));
+            if phys == PhysAddr::null() {
+                log::warn!("bulk_memcpy: client vaddr {:#x} not mapped", va);
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            let mapping = match PerCPUPageMappingGuard::create_4k(phys) {
+                Ok(m) => m,
+                Err(_) => return CUDA_ERROR_INVALID_VALUE,
+            };
+            let client_page = unsafe {
+                core::slice::from_raw_parts_mut(
+                    mapping.virt_addr().as_mut_ptr::<u8>(), PAGE_SIZE)
+            };
+
+            if kind == MEMCPY_HOST_TO_DEVICE {
+                service.data[MEMCPY_HDR + filled..MEMCPY_HDR + filled + take]
+                    .copy_from_slice(&client_page[page_off..page_off + take]);
+            }
+            // D2H fills the client pages after the service replies, so
+            // remember nothing here; the second pass below re-walks.
+            filled += take;
         }
 
         forward_call(service, MEMCPY_ID);
@@ -496,10 +506,31 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
             err = e;
             break;
         }
+
         if kind == MEMCPY_DEVICE_TO_HOST {
-            client_page[page_off..page_off + chunk]
-                .copy_from_slice(&service.data[MEMCPY_HDR..MEMCPY_HDR + chunk]);
+            let mut written: usize = 0;
+            while written < chunk {
+                let va = host_addr + written as u64;
+                let page_off = (va & 0xFFF) as usize;
+                let take = core::cmp::min(PAGE_SIZE - page_off, chunk - written);
+                let phys = page_table_ref.get_page_4k_hugeaware(VirtAddr::from(va));
+                if phys == PhysAddr::null() {
+                    return CUDA_ERROR_INVALID_VALUE;
+                }
+                let mapping = match PerCPUPageMappingGuard::create_4k(phys) {
+                    Ok(m) => m,
+                    Err(_) => return CUDA_ERROR_INVALID_VALUE,
+                };
+                let client_page = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        mapping.virt_addr().as_mut_ptr::<u8>(), PAGE_SIZE)
+                };
+                client_page[page_off..page_off + take].copy_from_slice(
+                    &service.data[MEMCPY_HDR + written..MEMCPY_HDR + written + take]);
+                written += take;
+            }
         }
+
         done += chunk as u64;
     }
     err
