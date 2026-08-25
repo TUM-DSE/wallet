@@ -1,5 +1,6 @@
 use crate::process_manager::process_paging::ProcessPageTableRef;
 use crate::process_manager::process_paging::ProcessPageFlags;
+use crate::address::PhysAddr;
 use crate::address::VirtAddr;
 use crate::process_runtime::ReturnTarget;
 use crate::process_runtime::RETURN_TO_PROCESS;
@@ -83,7 +84,11 @@ impl ProcessRuntimeGpu for PALContext {
             | ProcessPageFlags::NO_EXECUTE;
         page_table_ref.map_4k_page(VirtAddr::from(addr), page, flags);
 
-        crate::gpu::direct::register_engine_page(core, page);
+        /* The trustlet's own page table goes with the registration: the
+           bulk memcpy path translates client source addresses itself
+           rather than having the payload copied through the comm page. */
+        crate::gpu::direct::register_engine_page(
+            core, page, PhysAddr::from(self.vmsa.cr3));
         log::warn!("gpu_channel: comm page {:#x?} mapped at {:#x}, polled by core {}",
                    page, addr, core);
 

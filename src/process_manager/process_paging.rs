@@ -619,6 +619,43 @@ impl ProcessPageTableRef {
     }
 
 
+    /// Physical address of the 4 KiB page containing `addr`, resolving
+    /// huge mappings on the way down.
+    ///
+    /// `get_page` walks PGD/PUD/PMD/PTE unconditionally, so a 2 MiB or
+    /// 1 GiB entry is misread as a page table and the walk fails. That
+    /// is fine for the small, monitor-allocated buffers it was written
+    /// for, but a guest mapping big enough to interest us - a model
+    /// file mmap, say - is exactly the case THP turns into huge pages.
+    /// Returns null if not present.
+    pub fn get_page_4k_hugeaware(&self, addr: VirtAddr) -> PhysAddr {
+        let (_pgd_mapping, pgd_table) = paddr_as_table!(self.process_page_table);
+        let mut table: &mut ProcessPageTablePage = pgd_table;
+        let mut table_entry = table[ProcessPageTable::index::<PGD>(addr)];
+        if !table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+            return PhysAddr::null();
+        }
+
+        let mut _mapping: PerCPUPageMappingGuard;
+        // Level sizes below PUD/PMD: a huge entry at that level covers
+        // this many bytes, and the low bits of addr index into it.
+        for (level, level_size) in [(PUD, 1u64 << 30), (PMD, 1u64 << 21), (PTE, 1u64 << 12)] {
+            (_mapping, table) = paddr_as_table!(strip_paddr!(table_entry.0));
+            table_entry = table[ProcessPageTable::index_arg(level, addr)];
+            if !table_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                return PhysAddr::null();
+            }
+            if level != PTE && table_entry.flags().contains(ProcessPageFlags::HUGE_PAGE) {
+                // Huge entry: frame base plus the offset of the 4 KiB
+                // page within it, masked back to 4 KiB alignment.
+                let base = u64::from(strip_paddr!(table_entry.0)) & !(level_size - 1);
+                let off = u64::from(addr) & (level_size - 1) & !0xFFFu64;
+                return PhysAddr::from(base + off);
+            }
+        }
+        strip_paddr!(table_entry.0)
+    }
+
     pub fn get_page(&self, addr: VirtAddr) -> PhysAddr{
         //Mapping the page table into Memory and get the next layer based on the address
         let (_pgd_mapping, pgd_table) = paddr_as_table!(self.process_page_table);

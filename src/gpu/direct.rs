@@ -3,6 +3,8 @@ use crate::{memory::paging::PerCPUPageMappingGuard, MonitorError, RequestParams}
 use core::sync::atomic::{AtomicU8, AtomicU32};
 use core::sync::atomic::Ordering;
 use crate::address::PhysAddr;
+use crate::address::VirtAddr;
+use crate::process_manager::process_paging::ProcessPageTableRef;
 extern "Rust" {
     fn wallet_get_apic_id() -> u32;
 }
@@ -113,8 +115,14 @@ pub fn engine_registered(core: usize) -> bool {
 /// Register a monitor-provisioned comm page (trustlet GPU channel) in
 /// `core`'s engine slot — same slot and polling as a guest client's
 /// page registered via register_engine.
-pub fn register_engine_page(core: usize, page: PhysAddr) {
-    unsafe { ENGINE_PAGES[core] = page; }
+pub fn register_engine_page(core: usize, page: PhysAddr, page_table: PhysAddr) {
+    unsafe {
+        ENGINE_PAGES[core] = page;
+        /* The bulk path translates client source addresses itself, so it
+           needs the client's page table. The guest-client path records
+           this in register_engine; trustlets come through here. */
+        ENGINE_PAGE_TABLE[core] = page_table;
+    }
 }
 
 /// Poll the engine page registered for `core` and relay calls to the
@@ -199,6 +207,15 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
             return LOOP_CLEAR;
         }
 
+        if call_id as u64 == BULK_MEMCPY {
+            // Handled entirely inside the monitor: one client round trip
+            // regardless of size, N monitor-to-service exchanges.
+            let err = bulk_memcpy(core, args, service);
+            args.data[0..4].copy_from_slice(&err.to_le_bytes());
+            args.lock.store(0, Ordering::Release);
+            continue;
+        }
+
         if let Some((req_len, resp_len)) = forward_spec(call_id, &args.data) {
             match service {
                 Some(service) => {
@@ -241,6 +258,11 @@ pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
 }
 
 /// cudaMemcpy payload travels inline after a 32-byte request header.
+/// Bulk memcpy id, outside the cudart enumeration like the cuBLAS
+/// range. One of these replaces ceil(count/4056) per-chunk calls.
+pub const BULK_MEMCPY: u64 = 700;
+const MEMCPY_ID: u32 = 121;
+const PAGE_SIZE: usize = 4096;
 const MEMCPY_HDR: usize = 32;
 const MEMCPY_MAX_PAYLOAD: usize = COMM_DATA_SIZE - MEMCPY_HDR;
 
@@ -373,6 +395,97 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
 
 /// Hand a call to the service comm page and wait for its completion.
 /// The request payload must already be in the service data area.
+/// Bulk memcpy: one client round trip for a transfer of any size.
+///
+/// The client sends {dst, src_vaddr, count, kind} and does NOT copy the
+/// payload anywhere. The monitor walks the client's own page table,
+/// maps each source page, and feeds the service in page-sized pieces
+/// without ever returning to the client. That is the point: a 1.3 GB
+/// model upload was 325,710 client round trips at 4056 bytes each, and
+/// the client round trip is the expensive one - it costs a VMPL switch
+/// and a spin on both sides. The monitor-to-service exchanges remain,
+/// but they are VMPL0 to VMPL2 with no trustlet involved.
+///
+/// Returns the CUDA error to hand back to the client.
+fn bulk_memcpy(core: usize, args: &CommunicationPage,
+               service: Option<&mut CommunicationPage>) -> i32 {
+    const CUDA_ERROR_INVALID_VALUE: i32 = 1;
+    const CUDA_ERROR_SYSTEM_NOT_READY: i32 = 802;
+
+    let dst = u64::from_le_bytes(args.data[0..8].try_into().unwrap());
+    let src = u64::from_le_bytes(args.data[8..16].try_into().unwrap());
+    let count = u64::from_le_bytes(args.data[16..24].try_into().unwrap());
+    let kind = i32::from_le_bytes(args.data[24..28].try_into().unwrap());
+
+    let service = match service {
+        Some(s) => s,
+        None => return CUDA_ERROR_SYSTEM_NOT_READY,
+    };
+
+    let table = unsafe { ENGINE_PAGE_TABLE[core] };
+    if table == PhysAddr::null() {
+        log::warn!("bulk_memcpy: no page table registered for engine {}", core);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if kind != MEMCPY_HOST_TO_DEVICE && kind != MEMCPY_DEVICE_TO_HOST {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    let mut page_table_ref = ProcessPageTableRef::default();
+    page_table_ref.set_external_table(u64::from(table));
+
+    let mut done: u64 = 0;
+    let mut err: i32 = 0;
+    while done < count {
+        let vaddr = src + done;
+        let page_off = (vaddr & 0xFFF) as usize;
+        let in_page = (PAGE_SIZE - page_off) as u64;
+        let chunk = core::cmp::min(
+            core::cmp::min(in_page, count - done),
+            MEMCPY_MAX_PAYLOAD as u64) as usize;
+
+        let phys = page_table_ref.get_page_4k_hugeaware(VirtAddr::from(vaddr));
+        if phys == PhysAddr::null() {
+            log::warn!("bulk_memcpy: client vaddr {:#x} not mapped", vaddr);
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        let mapping = match PerCPUPageMappingGuard::create_4k(phys) {
+            Ok(m) => m,
+            Err(_) => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let client_page = unsafe {
+            core::slice::from_raw_parts_mut(
+                mapping.virt_addr().as_mut_ptr::<u8>(), PAGE_SIZE)
+        };
+
+        // Same 32-byte header the per-call memcpy path uses, so the
+        // service needs no new dispatch arm.
+        service.data[0..8].copy_from_slice(&(dst + done).to_le_bytes());
+        service.data[8..16].copy_from_slice(&(src + done).to_le_bytes());
+        service.data[16..24].copy_from_slice(&(chunk as u64).to_le_bytes());
+        service.data[24..28].copy_from_slice(&kind.to_le_bytes());
+
+        if kind == MEMCPY_HOST_TO_DEVICE {
+            service.data[MEMCPY_HDR..MEMCPY_HDR + chunk]
+                .copy_from_slice(&client_page[page_off..page_off + chunk]);
+        }
+
+        forward_call(service, MEMCPY_ID);
+
+        let e = i32::from_le_bytes(service.data[0..4].try_into().unwrap());
+        if e != 0 {
+            err = e;
+            break;
+        }
+        if kind == MEMCPY_DEVICE_TO_HOST {
+            client_page[page_off..page_off + chunk]
+                .copy_from_slice(&service.data[MEMCPY_HDR..MEMCPY_HDR + chunk]);
+        }
+        done += chunk as u64;
+    }
+    err
+}
+
 fn forward_call(service: &mut CommunicationPage, call_id: u32) {
     service.id.store(call_id, Ordering::Relaxed);
     service.lock.store(1, Ordering::Release);
