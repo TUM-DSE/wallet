@@ -242,7 +242,7 @@ impl ProcessContext {
         let page_table_ref = base.page_table_ref;
         // Create VMSA for Zygote
         // Will be used as base for Trustlet VMSA
-        let new_vmsa_page = allocate_page();
+        let new_vmsa_page = crate::process_manager::process_memory::allocate_vmsa_page();
         let new_vmsa_mapping = PerCPUPageMappingGuard::create_4k(new_vmsa_page).unwrap();
         let new_vmsa_vaddr = new_vmsa_mapping.virt_addr();
 
@@ -319,7 +319,7 @@ impl ProcessContext {
         let page_table_ref = new_page_table_ref;
 
         //Creating new VMSA for the Process
-        let new_vmsa_page = allocate_page();
+        let new_vmsa_page = crate::process_manager::process_memory::allocate_vmsa_page();
         let new_vmsa_mapping = PerCPUPageMappingGuard::create_4k(new_vmsa_page).unwrap();
         let new_vmsa_vaddr = new_vmsa_mapping.virt_addr();
 

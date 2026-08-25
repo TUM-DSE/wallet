@@ -305,6 +305,41 @@ pub fn allocate_page() -> PhysAddr {
     PROCESS_MEM_CONFIG.lock().get_free_page()
 }
 
+/// A page usable as a guest VMSA. KVM's sev_snp_ap_creation REJECTS
+/// any AP-creation whose VMSA GPA is 2 MiB-aligned (upstream SNP
+/// hugepage-erratum workaround), and the bump allocator's
+/// near-deterministic session cost walked the zygote VMSA onto such a
+/// boundary at exactly the 5th session of a boot - the
+/// "register_guest_vmsa failed" panic, root-caused 2026-08-25 (the
+/// probed VMSA low bits drifted 0x84000 -> 0x63000 -> 0x42000 ->
+/// 0x21000 -> 0x00000 across sessions). Skip aligned pages; rejects
+/// go back to the free list AFTER a good page is in hand (the free
+/// list is LIFO - freeing first would hand the same page straight
+/// back).
+pub fn allocate_vmsa_page() -> PhysAddr {
+    const TWO_MIB_MASK: u64 = 0x1F_FFFF;
+    let mut rejected: [PhysAddr; 8] = [PhysAddr::null(); 8];
+    let mut n = 0;
+    let page = loop {
+        let p = PROCESS_MEM_CONFIG.lock().get_free_page();
+        if u64::from(p) & TWO_MIB_MASK != 0 {
+            break p;
+        }
+        log::warn!("allocate_vmsa_page: skipping 2 MiB-aligned {:#x}", u64::from(p));
+        if n < rejected.len() {
+            rejected[n] = p;
+            n += 1;
+        }
+        // more than 8 consecutive aligned pages cannot come from the
+        // bump path (1 in 512) - and a free list that pathological
+        // just leaks the ninth; a page is 4 KiB, acceptable.
+    };
+    for r in rejected.iter().take(n) {
+        PROCESS_MEM_CONFIG.lock().add_free_page(*r);
+    }
+    page
+}
+
 //pub fn free_page(paddr: u64) {
 //    PROCESS_MEM_CONFIG.lock().free_page(paddr);
 //}
