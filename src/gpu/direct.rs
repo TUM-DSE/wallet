@@ -165,6 +165,190 @@ pub fn register_window(params: &mut RequestParams) -> Result<(), MonitorError> {
     Ok(())
 }
 
+/// Shared heap (the window generalized, see PLAN.md): pinned SERVICE
+/// memory that the client ALLOCATES from (cudaMallocHost interception),
+/// so descriptors can name payload by heap offset and nobody copies
+/// per byte. Offsets are the shared address space - raw host VAs never
+/// cross the relay, which is what keeps "addresses" consistent between
+/// an engine and its service. Registered in append-only bites of at
+/// most one list page (512 pages = 2 MiB); chunks are offset-contiguous
+/// but need not be VA-contiguous anywhere.
+///
+/// Growth is client-triggered: a HEAP_GROW descriptor is relayed to the
+/// service, which allocates and registers another chunk; poll_engine
+/// then maps the delta into the requesting trustlet before completing
+/// the call (the trustlet is spinning on the comm page at that moment,
+/// so its page table only gains entries while nothing faults - and
+/// added mappings need no TLB shootdown).
+pub const GPU_HEAP_MAX_PAGES: usize = 262144; // 1 GiB per engine
+pub const GPU_HEAP_VADDR: u64 = 0x48100000000;
+
+/// Per-engine heap page directories: one monitor page of pointers to
+/// monitor pages of physical addresses (512 * 512 pages = 1 GiB max),
+/// plus the any-engine fallback slot, mirroring windows/services.
+static mut HEAP_DIRS: [PhysAddr; 64] = [PhysAddr::null(); 64];
+static mut HEAP_NPAGES: [u64; 64] = [0; 64];
+static mut HEAP_DIR_ANY: PhysAddr = PhysAddr::null();
+static mut HEAP_NPAGES_ANY: u64 = 0;
+
+/// How many heap pages are mapped into the trustlet on `core` (grows
+/// at gpu_channel time and after HEAP_GROW relays).
+static mut HEAP_MAPPED: [u64; 64] = [0; 64];
+
+/// Whether the engine slot on `core` is a monitor-provisioned trustlet
+/// channel (gpu_channel) rather than a guest client (register_engine).
+/// Only trustlet channels get heap pages mapped by the monitor - a
+/// guest client maps the heap itself through vmpl.ko, and writing a
+/// guest process page table from here would corrupt the guest kernel's
+/// bookkeeping.
+static mut ENGINE_IS_TRUSTLET: [bool; 64] = [false; 64];
+
+fn heap_for(core: usize) -> (PhysAddr, usize) {
+    unsafe {
+        if core < 64 && HEAP_DIRS[core] != PhysAddr::null() && HEAP_NPAGES[core] != 0 {
+            return (HEAP_DIRS[core], HEAP_NPAGES[core] as usize);
+        }
+        (HEAP_DIR_ANY, HEAP_NPAGES_ANY as usize)
+    }
+}
+
+/// Physical address of heap page `idx` from directory `dir`.
+fn heap_page(dir: PhysAddr, idx: usize) -> PhysAddr {
+    let (_dm, dir_page) = paddr_as_slice!(dir);
+    let list = PhysAddr::from(dir_page[idx / 512]);
+    if list == PhysAddr::null() {
+        return PhysAddr::null();
+    }
+    let (_lm, list_page) = paddr_as_slice!(list);
+    PhysAddr::from(list_page[idx % 512])
+}
+
+pub fn register_heap(params: &mut RequestParams) -> Result<(), MonitorError> {
+    // Args:
+    //  rcx: phys address of a page holding this bite's physical page
+    //       list (u64 per page, vmpl.ko-pinned service memory)
+    //  rdx: number of pages in the list (<= 512)
+    //  r8:  engine (>= 64 = any)
+    //  r9:  heap page offset this bite starts at; must equal the pages
+    //       registered so far (append-only, no holes)
+    // Returns (rcx): 0 ok, -1 bad arguments.
+    let list_phys = PhysAddr::from(params.rcx);
+    let npages = params.rdx as usize;
+    let engine = params.r8 as usize;
+    let offset = params.r9 as usize;
+    let reject = |params: &mut RequestParams| {
+        params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
+    };
+    if list_phys == PhysAddr::null() || npages == 0 || npages > 512
+        || offset + npages > GPU_HEAP_MAX_PAGES {
+        log::warn!("GPU heap registration rejected: list {:#x?}, {} pages at {}",
+                   list_phys, npages, offset);
+        reject(params);
+        return Ok(());
+    }
+    let current = unsafe {
+        if engine < 64 { HEAP_NPAGES[engine] } else { HEAP_NPAGES_ANY }
+    } as usize;
+    if offset != current {
+        log::warn!("GPU heap registration rejected: offset {} != current {} \
+                    (append-only)", offset, current);
+        reject(params);
+        return Ok(());
+    }
+    let dir = unsafe {
+        if engine < 64 { HEAP_DIRS[engine] } else { HEAP_DIR_ANY }
+    };
+    let dir = if dir == PhysAddr::null() {
+        let d = allocate_page();
+        let (_m, dp) = paddr_as_slice!(d);
+        for i in 0..512 { dp[i] = 0; }
+        unsafe {
+            if engine < 64 { HEAP_DIRS[engine] = d; } else { HEAP_DIR_ANY = d; }
+        }
+        d
+    } else { dir };
+
+    /* Copy this bite's entries into monitor-owned list pages (same
+       TOCTOU argument as the window: later trustlet mappings must see
+       registration-time contents). */
+    let (_gm, guest_list) = paddr_as_slice!(list_phys);
+    for i in 0..npages {
+        let idx = offset + i;
+        let (_dm, dir_page) = paddr_as_slice!(dir);
+        if PhysAddr::from(dir_page[idx / 512]) == PhysAddr::null() {
+            let l = allocate_page();
+            let (_m, lp) = paddr_as_slice!(l);
+            for j in 0..512 { lp[j] = 0; }
+            dir_page[idx / 512] = u64::from(l);
+        }
+        let list = PhysAddr::from(dir_page[idx / 512]);
+        let (_lm, list_page) = paddr_as_slice!(list);
+        list_page[idx % 512] = guest_list[i];
+    }
+    unsafe {
+        if engine < 64 { HEAP_NPAGES[engine] = (offset + npages) as u64; }
+        else { HEAP_NPAGES_ANY = (offset + npages) as u64; }
+    }
+    log::warn!("GPU heap registration: +{} pages at {} ({} KiB total), engine {}",
+               npages, offset, (offset + npages) * 4, engine);
+    params.rcx = 0;
+    Ok(())
+}
+
+/// Map heap pages [from, to) into the trustlet page table `cr3` at
+/// GPU_HEAP_VADDR, VMPL1|RW. Returns pages actually mapped.
+pub fn map_heap_range(cr3: PhysAddr, dir: PhysAddr, from: usize, to: usize) -> usize {
+    let mut page_table_ref = ProcessPageTableRef::default();
+    page_table_ref.set_external_table(u64::from(cr3));
+    let flags = crate::process_manager::process_paging::ProcessPageFlags::PRESENT
+        | crate::process_manager::process_paging::ProcessPageFlags::WRITABLE
+        | crate::process_manager::process_paging::ProcessPageFlags::USER_ACCESSIBLE
+        | crate::process_manager::process_paging::ProcessPageFlags::ACCESSED
+        | crate::process_manager::process_paging::ProcessPageFlags::NO_EXECUTE;
+    let mut mapped = 0;
+    for idx in from..to {
+        let phys = heap_page(dir, idx);
+        if phys == PhysAddr::null() {
+            break;
+        }
+        let guard = match PerCPUPageMappingGuard::create_4k(phys) {
+            Ok(g) => g,
+            Err(_) => break,
+        };
+        if crate::sev::rmp_adjust(guard.virt_addr(),
+                crate::sev::RMPFlags::VMPL1
+                    | crate::sev::RMPFlags::READ | crate::sev::RMPFlags::WRITE,
+                crate::types::PageSize::Regular).is_err() {
+            break;
+        }
+        page_table_ref.map_4k_page(
+            VirtAddr::from(GPU_HEAP_VADDR + (idx as u64) * 4096), phys, flags);
+        mapped += 1;
+    }
+    mapped
+}
+
+/// Called from gpu_channel: map the whole registered heap for `core`'s
+/// fresh trustlet and record the trustlet-ness of the slot. Returns
+/// mapped bytes (0 = no heap).
+pub fn map_heap_for_trustlet(core: usize, cr3: PhysAddr) -> u64 {
+    unsafe { ENGINE_IS_TRUSTLET[core] = true; }
+    let (dir, npages) = heap_for(core);
+    if dir == PhysAddr::null() || npages == 0 {
+        unsafe { HEAP_MAPPED[core] = 0; }
+        return 0;
+    }
+    let mapped = map_heap_range(cr3, dir, 0, npages);
+    unsafe { HEAP_MAPPED[core] = mapped as u64; }
+    if mapped != npages {
+        log::warn!("gpu heap: mapped {}/{} pages for core {} - heap not exposed",
+                   mapped, npages, core);
+        unsafe { HEAP_MAPPED[core] = 0; }
+        return 0;
+    }
+    (mapped as u64) * 4096
+}
+
 pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
     // Args:
     //  rcx: shared page phys address
@@ -184,6 +368,10 @@ pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
     unsafe {
         ENGINE_PAGE_TABLE[id] = PhysAddr::from(page_table);
         ENGINE_PAGES[id] = PhysAddr::from(comm_page);
+        /* Guest client: the monitor must never write this page table
+           (the guest kernel owns it); heap mapping is the client's own
+           mmap business. */
+        ENGINE_IS_TRUSTLET[id] = false;
     };
 
     let donated = unsafe { crate::exclusive::CONTROL[id] } != PhysAddr::null();
@@ -308,6 +496,32 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
                     service.data[..req_len].copy_from_slice(&args.data[..req_len]);
                     forward_call(service, call_id);
                     args.data[..resp_len].copy_from_slice(&service.data[..resp_len]);
+                    /* The service just registered more heap chunk(s):
+                       map the delta into this core's trustlet before
+                       the client sees the new size. The trustlet is
+                       spinning on this comm page right now, so its
+                       page table only GAINS entries - safe without a
+                       TLB shootdown (x86 does not cache not-present).
+                       Guest clients map the heap themselves. */
+                    if call_id as u64 == HEAP_GROW
+                        && unsafe { ENGINE_IS_TRUSTLET[core] } {
+                        let (dir, npages) = heap_for(core);
+                        let done = unsafe { HEAP_MAPPED[core] } as usize;
+                        if dir != PhysAddr::null() && npages > done {
+                            let cr3 = unsafe { ENGINE_PAGE_TABLE[core] };
+                            let mapped = map_heap_range(cr3, dir, done, npages);
+                            unsafe { HEAP_MAPPED[core] = (done + mapped) as u64; }
+                            if done + mapped != npages {
+                                /* Partial: report the size that IS
+                                   mapped so the client never touches
+                                   unmapped heap. */
+                                let usable = ((done + mapped) * 4096) as u64;
+                                args.data[0..8].copy_from_slice(&usable.to_le_bytes());
+                                log::warn!("heap grow: mapped {}/{} for core {}",
+                                           done + mapped, npages, core);
+                            }
+                        }
+                    }
                 }
                 None => {
                     // No service registered: fail the call with
@@ -352,6 +566,12 @@ pub const BULK_MEMCPY: u64 = 700;
 /// registration time. The comm page only carries a 28-byte descriptor
 /// per windowful; the monitor copies nothing.
 pub const WINDOW_MEMCPY: u64 = 701;
+/// Shared-heap ids: grow request (relayed to the service, which
+/// allocates and registers another chunk; the monitor then maps the
+/// delta into the requesting trustlet) and heap memcpy (payload named
+/// by heap offset, nobody copies).
+pub const HEAP_GROW: u64 = 702;
+pub const HEAP_MEMCPY: u64 = 703;
 const MEMCPY_ID: u32 = 121;
 const PAGE_SIZE: usize = 4096;
 const MEMCPY_HDR: usize = 32;
@@ -469,6 +689,16 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
         // req: 144-byte fixed header (scalars + device pointers +
         // inline 16-byte alpha/beta slots); resp: i32 status
         Some((144, 4))
+    } else if id == HEAP_GROW {
+        // req: u64 min bytes needed; resp: u64 new total heap bytes
+        // (0 = grow failed). The service does the allocation and the
+        // register_gpu_heap ioctl inside this call.
+        Some((8, 8))
+    } else if id == HEAP_MEMCPY {
+        // req: u64 device ptr, u64 count, u64 heap offset, i32 kind;
+        // resp: i32 err. Like WINDOW_MEMCPY, but the payload already
+        // lives in the shared heap - not even the client copies.
+        Some((28, 4))
     } else if id == WINDOW_MEMCPY {
         // req: u64 device ptr, u64 count, u64 window offset, i32 kind;
         // resp: i32 err. The payload travels through the shared staging

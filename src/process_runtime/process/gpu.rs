@@ -144,6 +144,18 @@ impl ProcessRuntimeGpu for PALContext {
         }
         self.vmsa.r9 = window_bytes;
 
+        /* Shared heap: map whatever the service has registered so far
+           at GPU_HEAP_VADDR (later growth is mapped by poll_engine
+           when it relays a HEAP_GROW). rbx reports the mapped bytes -
+           0 means no heap, client allocates from plain memory and
+           large copies stay on the window path. */
+        self.vmsa.rbx = crate::gpu::direct::map_heap_for_trustlet(
+            core, PhysAddr::from(self.vmsa.cr3));
+        if self.vmsa.rbx != 0 {
+            log::warn!("gpu_channel: shared heap mapped at {:#x} ({} KiB)",
+                       crate::gpu::direct::GPU_HEAP_VADDR, self.vmsa.rbx >> 10);
+        }
+
         self.vmsa.rcx = 0;
         /* Which engine slot this trustlet got: the service that serves
            it must register with SERVICE_ENGINE set to the same core. */

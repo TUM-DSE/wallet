@@ -188,6 +188,8 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
             crate::gpu::direct::register_service(params),
         MonitorCallType::RegisterGpuWindow =>
             crate::gpu::direct::register_window(params),
+        MonitorCallType::RegisterGpuHeap =>
+            crate::gpu::direct::register_heap(params),
         _ => Err(MonitorError::unsupported()),
     };
 
