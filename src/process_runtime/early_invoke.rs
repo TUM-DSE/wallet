@@ -43,6 +43,9 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
 
     //_ = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
     log::info!("Successfully called PALContext");
+    /* F5 instrumentation: which page is being registered, so it can
+       be matched against the RECYCLED log above. */
+    log::warn!("[vmsa] registering {:#x} (vmpl {})", u64::from(vmsa_paddr), TRUSTLET_VMPL);
     let ok = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
     log::info!("register_guest_vmsa(vmpl={}, sev_features={:x}) -> {}",
                TRUSTLET_VMPL, sev_features, ok);
