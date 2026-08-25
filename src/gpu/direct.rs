@@ -712,10 +712,12 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
         // register_gpu_heap ioctl inside this call.
         Some((8, 8))
     } else if id == HEAP_MEMCPY {
-        // req: u64 device ptr, u64 count, u64 heap offset, i32 kind;
-        // resp: i32 err. Like WINDOW_MEMCPY, but the payload already
-        // lives in the shared heap - not even the client copies.
-        Some((28, 4))
+        // req: u64 device ptr, u64 count, u64 heap offset, i32 kind,
+        // i32 is_async @28, u64 stream token @32; resp: i32 err. Like
+        // WINDOW_MEMCPY, but the payload already lives in the shared
+        // heap - not even the client copies - and async copies stay
+        // ordered on (or captured into) the client's stream.
+        Some((40, 4))
     } else if id == WINDOW_MEMCPY {
         // req: u64 device ptr, u64 count, u64 window offset, i32 kind;
         // resp: i32 err. The payload travels through the shared staging
