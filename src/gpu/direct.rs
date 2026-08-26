@@ -659,6 +659,8 @@ const CUBLAS_DESTROY: u64 = 601;
 const CUBLAS_SET_STREAM: u64 = 602;
 const CUBLAS_SET_MATH_MODE: u64 = 603;
 const CUBLAS_GEMM_STRIDED_BATCHED_EX: u64 = 604;
+const CUBLAS_GEMM_BATCHED_EX: u64 = 605;
+const CUBLAS_GEMM_EX: u64 = 606;
 
 /// cudaLaunchKernel: kernel params packed after a 56-byte header at the
 /// driver-provided offsets; args_len is a u32 at request offset 48.
@@ -755,6 +757,13 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
         // req: 144-byte fixed header (scalars + device pointers +
         // inline 16-byte alpha/beta slots); resp: i32 status
         Some((144, 4))
+    } else if id == CUBLAS_GEMM_BATCHED_EX || id == CUBLAS_GEMM_EX {
+        // 605: like 604 minus the strides - the batched variant's
+        // Aarray/Barray/Carray are device pointers ggml built
+        // on-device, plain values here. 606: the non-batched sibling,
+        // same wire shape. req: 120-byte header (scalars + 3 pointers
+        // + inline 16-byte alpha/beta at 88/104); resp: i32 status
+        Some((120, 4))
     } else if id == HEAP_GROW {
         // req: u64 min bytes needed; resp: u64 new total heap bytes
         // (0 = grow failed). The service does the allocation and the
