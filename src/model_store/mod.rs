@@ -23,6 +23,28 @@ fn convert(num: i64) -> u64 {
     u64::from_ne_bytes(num.to_ne_bytes())
 }
 
+/* Guest-supplied store ids and PGD slots index straight into a Vec
+   and a [u64;512]; unchecked, either is a monitor panic (which kills
+   the VM, not just the caller). Each op keeps its OWN failure signal
+   rather than the negative STATUS_* classes: the guest decodes
+   get/get_undo as `rcx_out > 0`, so a negative value there would read
+   as a huge successful size. See lib/guest/wallet/src/store.c. */
+fn store_id_ok(store_id: u64, store: &Store<StoreEntry>) -> bool {
+    if (store_id as usize) < store.len() {
+        return true;
+    }
+    log::warn!("store: id {} out of range", store_id);
+    false
+}
+
+fn pgd_idx_ok(idx: u64) -> bool {
+    if idx < 512 {
+        return true;
+    }
+    log::warn!("store: guest PGD slot {} out of range", idx);
+    false
+}
+
 fn load_init(params: &mut RequestParams) -> AllocationRange {
     capture(200);
     let size = params.rcx;
@@ -32,6 +54,17 @@ fn load_init(params: &mut RequestParams) -> AllocationRange {
 
     if size == 0 {
         log::warn!("Zero sized allocation requested!");
+        return AllocationRange(0,0);
+    }
+
+    /* size is entirely guest-chosen and drives a per-page allocation
+       loop; without this the bump allocator walked past its region and
+       pvalidate panicked. Leave one page of slack for the mapping
+       structures the allocation itself needs. */
+    let pages = size.div_ceil(PAGE_SIZE_4K);
+    let available = crate::process_manager::process_memory::pages_available();
+    if pages + 1 >= available {
+        log::warn!("load_init: {} pages requested, {} available", pages, available);
         return AllocationRange(0,0);
     }
 
@@ -66,6 +99,10 @@ fn load_fin(params: &mut RequestParams, store: &Store<StoreEntry>) -> bool{
 
     log::debug!("load_fin: StoreID: {:x?}, Guest PGD: {:x?}", store_id, guest_pgd);
 
+    if !store_id_ok(store_id, store) {
+        params.rcx = 1;
+        return false;
+    }
     let (_map, page_table) = paddr_as_slice!(guest_pgd.into());
     let e = store.get(store_id.try_into().unwrap());
     if e.state {
@@ -107,6 +144,10 @@ pub fn delete(params: &mut RequestParams, store: &Store<StoreEntry>) -> Result<(
 
     log::debug!("Removing: {store_id} from store");
 
+    if !store_id_ok(store_id, store) {
+        params.rcx = 1;
+        return Ok(())
+    }
     let e = store.get(store_id.try_into().unwrap());
     if e.state{
         log::warn!("Attempting to delete empty store entry");
@@ -130,6 +171,10 @@ pub fn get(params: &mut RequestParams, store: &Store<StoreEntry>) -> Result<(), 
 
     log::debug!("Mapping: {store_id} from store");
 
+    if !store_id_ok(store_id, store) || !pgd_idx_ok(params.r8) {
+        params.rcx = 0;
+        return Ok(())
+    }
     let e = store.get(store_id.try_into().unwrap());
     if e.state{
         log::warn!("Attempting to map empty store entry");
@@ -151,6 +196,10 @@ pub fn get_undo(params: &mut RequestParams, store: &Store<StoreEntry>) -> Result
 
     log::debug!("Removing mapping: {store_id} from store");
 
+    if !store_id_ok(store_id, store) || !pgd_idx_ok(params.r8) {
+        params.rcx = 0;
+        return Ok(())
+    }
     let e = store.get(store_id.try_into().unwrap());
     if e.state{
         log::warn!("Attempting to remove mapping to empty store entry");

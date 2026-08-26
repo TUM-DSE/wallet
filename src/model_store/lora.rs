@@ -29,5 +29,7 @@ pub fn lora_get(params: &mut RequestParams) -> Result<(), MonitorError> {
 }
 
 pub fn lora_get_undo(params: &mut RequestParams) -> Result<(), MonitorError> {
-    get(params, &LORA_STORE)
+    /* Was `get`: copy-paste bug, so undo RE-mapped instead of
+       unmapping (model_get_undo always had this right). */
+    get_undo(params, &LORA_STORE)
 }

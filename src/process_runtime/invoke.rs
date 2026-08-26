@@ -104,7 +104,21 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
     let (invoke_data, range) = ProcessPageTableRef::copy_data_from_guest(guest_data, guest_data_size, guest_page_table);
     let invoke_data_struct = vaddr_as_u64_slice!(invoke_data);
 
-    let invocation_type : TrustletInvocationType = invoke_data_struct[0].try_into().unwrap();
+    /* invoke_data_struct comes out of a GUEST-written page: an
+       out-of-range discriminant panicked the monitor here. Release the
+       range first - copy_data_from_guest already allocated and mounted
+       it, and `panic = abort` means nothing unwinds. */
+    let invocation_type: TrustletInvocationType = match invoke_data_struct[0].try_into() {
+        Ok(t) => t,
+        Err(_) => {
+            log::warn!("invoke_trustlet: invalid invocation type {}",
+                       invoke_data_struct[0]);
+            range.unmount();
+            range.delete();
+            params.rcx = super::TrustletReturnType::ERROR as u64;
+            return Ok(());
+        }
+    };
 
     let function_arg = invoke_data_struct[1];
     let function_arg_size = invoke_data_struct[2];
@@ -180,7 +194,17 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
             let data_page = page_table_ref.get_page(VirtAddr::from(data_ptr));
             let offset = (data_ptr & 0xFFF) as usize;
             let (_mapping, data_mapping) = map_paddr!(data_page);
-            assert!(offset + invocation_arg_size <= PAGE_SIZE_4K as usize, "Data size exceeds page size");
+            /* invocation_arg_size is guest-supplied: the assert was a
+               monitor panic, and `offset + size` overflowed before it
+               could even fire (overflow-checks are on in the shipping
+               dev profile). */
+            if invocation_arg_size > PAGE_SIZE_4K as usize
+                || offset + invocation_arg_size > PAGE_SIZE_4K as usize {
+                log::warn!("invoke_trustlet: arg size {} at offset {} exceeds a page",
+                           invocation_arg_size, offset);
+                params.rcx = super::TrustletReturnType::ERROR as u64;
+                return Ok(());
+            }
             let data = unsafe { core::slice::from_raw_parts_mut(data_mapping.as_mut_ptr::<u8>().wrapping_add(offset), invocation_arg_size) };
             //log::info!("invocation_arg_size: {}", invocation_arg_size);
             for i in 0..invocation_arg_size {
@@ -218,7 +242,13 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
             for i in 0..512 {
                new_page_mapped[i] = buf[i];
             }
-            assert!(trustlet.pf_target_vaddr != 0);
+            /* MMAP invocation on a trustlet with no pending mmap
+               fault: guest-triggerable, was a monitor panic. */
+            if trustlet.pf_target_vaddr == 0 {
+                log::warn!("invoke_trustlet: MMAP invocation with no pending fault");
+                params.rcx = super::TrustletReturnType::ERROR as u64;
+                return Ok(());
+            }
             let dst = VirtAddr::from(trustlet.pf_target_vaddr);
             // update trustlet's page table
             let flags = ProcessPageFlags::FLAG_REUSE;

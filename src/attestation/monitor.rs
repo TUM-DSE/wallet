@@ -195,12 +195,41 @@ pub fn measure(_start_address: u64, _size: u64) -> [u8; HASH_SIZE] {
     hash
 }
 
-fn copy_back_report(report_buffer: u64, report_data: &[u8], report_size: usize) {
-  // Ensure the size is within limits to avoid out-of-bounds access
-  assert!(report_size <= PAGE_SIZE, "Report size exceeds the allowed page size.");
+/* A guest-supplied PHYSICAL page address is only safe to map if it is
+   non-null and page-aligned: create_4k panics inside the SVSM on an
+   unaligned address and silently succeeds on a garbage-but-aligned
+   one (phys 0 being what a failed guest pagewalk yields). */
+fn guest_page_ok(addr: PhysAddr, what: &str) -> bool {
+    if addr.is_null() || !addr.is_page_aligned() {
+        log::warn!("attestation: {} address {:#x?} is null or unaligned", what, addr);
+        return false;
+    }
+    true
+}
 
+/* Returns false if the report could not be written back.
+   report_buffer is a guest-supplied PHYSICAL address: create_4k
+   panics inside the SVSM on an unaligned one and silently SUCCEEDS on
+   a garbage-but-aligned one (including 0, which is what a failed
+   guest pagewalk produces - that wrote the report into guest physical
+   page 0). Both are checked here. */
+fn copy_back_report(report_buffer: u64, report_data: &[u8], report_size: usize) -> bool {
+  if report_size > PAGE_SIZE {
+      log::warn!("attestation: report size {} exceeds a page", report_size);
+      return false;
+  }
   let report_address = PhysAddr::from(report_buffer);
-  let mapped_report_page = PerCPUPageMappingGuard::create_4k(report_address).unwrap();
+  if report_address.is_null() || !report_address.is_page_aligned() {
+      log::warn!("attestation: report buffer {:#x?} is null or unaligned", report_address);
+      return false;
+  }
+  let mapped_report_page = match PerCPUPageMappingGuard::create_4k(report_address) {
+      Ok(m) => m,
+      Err(_) => {
+          log::warn!("attestation: cannot map report buffer {:#x?}", report_address);
+          return false;
+      }
+  };
   let report = unsafe {
         mapped_report_page.virt_addr()
             .as_mut_ptr::<[u8; PAGE_SIZE]>()
@@ -208,6 +237,7 @@ fn copy_back_report(report_buffer: u64, report_data: &[u8], report_size: usize) 
             .unwrap()
     };
   report[0..report_size].copy_from_slice(&report_data[0..report_size]);
+  true
 }
 
 #[allow(non_snake_case)]
@@ -284,8 +314,11 @@ fn zygote_report(params: &mut RequestParams) -> Result<(), MonitorError>{
         new_report.extend_from_slice(existing_report);
     }
     else {
-        log::info!("SNP report is missing");
-        panic!();
+        /* Guest-triggerable by ORDERING: ask for a zygote/trustlet
+           report before any monitor attestation has cached the SNP
+           report. Was a panic, i.e. the whole VM. */
+        log::warn!("SNP report is missing - attest the monitor first");
+        return Err(MonitorError::invalid_params());
     }
 
     // Append the measurements to the new report
@@ -322,8 +355,11 @@ fn trustlet_report(params: &mut RequestParams) -> Result<(), MonitorError>{
         new_report.extend_from_slice(existing_report);
     }
     else {
-        log::info!("SNP report is missing");
-        panic!();
+        /* Guest-triggerable by ORDERING: ask for a zygote/trustlet
+           report before any monitor attestation has cached the SNP
+           report. Was a panic, i.e. the whole VM. */
+        log::warn!("SNP report is missing - attest the monitor first");
+        return Err(MonitorError::invalid_params());
     }
 
     // Append the measurements to the new report
@@ -397,8 +433,11 @@ fn function_report(params: &mut RequestParams) -> Result<(), MonitorError>{
       new_report.extend_from_slice(existing_report);
     }
     else {
-        log::info!("SNP report is missing");
-        panic!();
+        /* Guest-triggerable by ORDERING: ask for a zygote/trustlet
+           report before any monitor attestation has cached the SNP
+           report. Was a panic, i.e. the whole VM. */
+        log::warn!("SNP report is missing - attest the monitor first");
+        return Err(MonitorError::invalid_params());
     }
 
     // Append the measurements to the new report
@@ -433,9 +472,20 @@ pub fn diff_attestation(params: &mut RequestParams) -> Result<(), MonitorError>{
         ZYGOTE_ATTESTATION | TRUSTLET_ATTESTATION
         | PREPARE_ZYGOTE_ATTESTATION_COLD | ZYGOTE_ATTESTATION_COLD
         | PREPARE_TRUSTLET_ATTESTATION_COLD | TRUSTLET_ATTESTATION_COLD);
-    if needs_pid && params.r8 as usize >= PROCESS_STORE.len() {
-        log::warn!("attestation: pid {} out of range", params.r8);
-        return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ID);
+    if needs_pid {
+        if params.r8 as usize >= PROCESS_STORE.len() {
+            log::warn!("attestation: pid {} out of range", params.r8);
+            return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ID);
+        }
+        /* Range alone is not enough: an EMPTY in-range slot has a null
+           page table, and the cold helpers map it and copy its entries
+           into the monitor's own PML4 - i.e. guest physical page 0
+           interpreted as a page table. */
+        if PROCESS_STORE.get(ProcessID(params.r8 as usize)).process_type
+            == crate::process_manager::process::TrustedProcessType::Undefined {
+            log::warn!("attestation: pid {} is an empty slot", params.r8);
+            return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ID);
+        }
     }
     let res = match params.rdx {
         MONITOR_ATTESTATION => {
@@ -503,7 +553,14 @@ pub fn get_public_key(params: &mut RequestParams) -> Result<(), MonitorError> {
     let encryption_keys: KeyPair = unsafe{*get_keys()};
 
     let target_address = PhysAddr::from(params.rcx);
-    let mapped_target_page = PerCPUPageMappingGuard::create_4k(target_address).unwrap();
+    if !guest_page_ok(target_address, "public key target") {
+        return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ARGS);
+    }
+    let mapped_target_page = match PerCPUPageMappingGuard::create_4k(target_address) {
+        Ok(m) => m,
+        Err(_) => return crate::process_manager::reject(
+            params, crate::process_manager::STATUS_BAD_ARGS),
+    };
     let target = unsafe {mapped_target_page.virt_addr().as_mut_ptr::<[u8;PAGE_SIZE]>().as_mut().unwrap()};
 
     let mut i: usize = 0;
@@ -523,14 +580,31 @@ pub fn get_public_key(params: &mut RequestParams) -> Result<(), MonitorError> {
 pub fn send_policy(params: &mut RequestParams) -> Result<(), MonitorError> {
     log::info!("[Monitor] Receiveing policy");
     let encrypted_data_address = PhysAddr::from(params.r8);
-    let mapped_enc_data_page = PerCPUPageMappingGuard::create_4k(encrypted_data_address).unwrap();
+    let sender_pub_key_address = PhysAddr::from(params.rcx);
+    /* rdx is the ciphertext length and is handed straight to decrypt()
+       over a SINGLE mapped page: the u64->u32 conversion panicked on
+       anything above u32::MAX, and any size past a page read beyond
+       the mapping. Bound it to the page before use. */
+    if !guest_page_ok(encrypted_data_address, "policy ciphertext")
+        || !guest_page_ok(sender_pub_key_address, "policy sender key")
+        || params.rdx > PAGE_SIZE as u64 {
+        return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ARGS);
+    }
+    let mapped_enc_data_page = match PerCPUPageMappingGuard::create_4k(encrypted_data_address) {
+        Ok(m) => m,
+        Err(_) => return crate::process_manager::reject(
+            params, crate::process_manager::STATUS_BAD_ARGS),
+    };
     let encrypted_data = unsafe {mapped_enc_data_page.virt_addr().as_mut_ptr::<[u8;PAGE_SIZE]>().as_mut().unwrap()};
 
-    let sender_pub_key_address = PhysAddr::from(params.rcx);
-    let mapped_sender_pub_key_page = PerCPUPageMappingGuard::create_4k(sender_pub_key_address).unwrap();
+    let mapped_sender_pub_key_page = match PerCPUPageMappingGuard::create_4k(sender_pub_key_address) {
+        Ok(m) => m,
+        Err(_) => return crate::process_manager::reject(
+            params, crate::process_manager::STATUS_BAD_ARGS),
+    };
     let sender_pub_key = unsafe {mapped_sender_pub_key_page.virt_addr().as_mut_ptr::<[u8;32]>().as_mut().unwrap()};
 
-    let encrypted_data_size: u32 = params.rdx.try_into().unwrap();
+    let encrypted_data_size: u32 = params.rdx as u32;
     let mut decrypted: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 
     let mut nonce: [u8; NONCE_SIZE] = [0; NONCE_SIZE];
@@ -659,8 +733,11 @@ fn zygote_report_cold(params: &mut RequestParams) -> Result<(), MonitorError>{
         new_report.extend_from_slice(existing_report);
     }
     else {
-        log::info!("SNP report is missing");
-        panic!();
+        /* Guest-triggerable by ORDERING: ask for a zygote/trustlet
+           report before any monitor attestation has cached the SNP
+           report. Was a panic, i.e. the whole VM. */
+        log::warn!("SNP report is missing - attest the monitor first");
+        return Err(MonitorError::invalid_params());
     }
 
     // Append the measurements to the new report
@@ -726,8 +803,11 @@ fn trustlet_report_cold(params: &mut RequestParams) -> Result<(), MonitorError>{
         new_report.extend_from_slice(existing_report);
     }
     else {
-        log::info!("SNP report is missing");
-        panic!();
+        /* Guest-triggerable by ORDERING: ask for a zygote/trustlet
+           report before any monitor attestation has cached the SNP
+           report. Was a panic, i.e. the whole VM. */
+        log::warn!("SNP report is missing - attest the monitor first");
+        return Err(MonitorError::invalid_params());
     }
 
     // Append the measurements to the new report

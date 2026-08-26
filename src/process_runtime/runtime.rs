@@ -170,6 +170,15 @@ impl ProcessRuntime for PALContext  {
 pub fn infer_call(params: &mut RequestParams) -> Result<(), MonitorError> {
     let tid = params.rcx;
     let guest_pgt = params.rdx;
+    /* Guest-supplied tid indexes the store unchecked (OOB =
+       monitor panic). Not reachable through vmpl.ko today (the
+       driver stubs these out), but the monitor must not trust
+       the driver. */
+    if params.rcx as usize >= PROCESS_STORE.len() {
+        log::warn!("infer_call: tid {} out of range", params.rcx);
+        return crate::process_manager::reject(
+            params, crate::process_manager::STATUS_BAD_ID);
+    }
     let trustlet = PROCESS_STORE.get(ProcessID(tid.try_into().unwrap()));
 
     let (_map, page_table) = paddr_as_slice!(guest_pgt.into());
@@ -189,6 +198,15 @@ pub fn infer_call(params: &mut RequestParams) -> Result<(), MonitorError> {
 pub fn infer_call_ret(params: &mut RequestParams) -> Result<(), MonitorError> {
     let tid = params.rcx;
     let guest_pgt = params.rdx;
+    /* Guest-supplied tid indexes the store unchecked (OOB =
+       monitor panic). Not reachable through vmpl.ko today (the
+       driver stubs these out), but the monitor must not trust
+       the driver. */
+    if params.rcx as usize >= PROCESS_STORE.len() {
+        log::warn!("infer_call_ret: tid {} out of range", params.rcx);
+        return crate::process_manager::reject(
+            params, crate::process_manager::STATUS_BAD_ID);
+    }
     let trustlet = PROCESS_STORE.get(ProcessID(tid.try_into().unwrap()));
 
     let (_map, page_table) = paddr_as_slice!(guest_pgt.into());

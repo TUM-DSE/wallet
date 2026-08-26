@@ -221,7 +221,9 @@ pub fn response_store(params: &mut RequestParams) -> Result<(), MonitorError> {
     }
 
     let idx = ((addr >> (9*3)) >> 12) & 0x1FF;
-    let (_mapping, page_table_mapping) = paddr_as_slice!(PhysAddr::from(page_table));
+    /* strip_paddr as in prompt_get: an unaligned guest rdx panics
+       inside the SVSM's create_4k assert. */
+    let (_mapping, page_table_mapping) = paddr_as_slice!(strip_paddr!(PhysAddr::from(page_table)));
     let pgd_entry = page_table_mapping[idx as usize];
 
     let idx2 = 7;

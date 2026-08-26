@@ -2,6 +2,7 @@
 use crate::{memory::paging::PerCPUPageMappingGuard, MonitorError, RequestParams};
 use core::sync::atomic::{AtomicU8, AtomicU32};
 use core::sync::atomic::Ordering;
+use crate::address::Address;
 use crate::address::PhysAddr;
 use crate::address::VirtAddr;
 use crate::process_manager::process_memory::allocate_page;
@@ -75,6 +76,14 @@ pub fn register_service(params: &mut RequestParams) -> Result<(), MonitorError> 
     let comm_page = params.rcx;
     let engine = params.r8 as usize;
     log::warn!("GPU service registration: {:#x?} engine {}", comm_page, engine);
+    /* Same deferred-panic argument as register_engine: forward_call
+       maps this page from the donated core. */
+    if PhysAddr::from(comm_page).is_null() || !PhysAddr::from(comm_page).is_page_aligned() {
+        log::warn!("GPU service registration rejected: comm page {:#x?}",
+                   PhysAddr::from(comm_page));
+        return crate::process_manager::reject(
+            params, crate::process_manager::STATUS_BAD_ARGS);
+    }
     unsafe {
         if engine < 64 {
             SERVICE_PAGES[engine] = PhysAddr::from(comm_page);
@@ -137,7 +146,8 @@ pub fn register_window(params: &mut RequestParams) -> Result<(), MonitorError> {
     let list_phys = PhysAddr::from(params.rcx);
     let npages = params.rdx as usize;
     let engine = params.r8 as usize;
-    if list_phys == PhysAddr::null() || npages == 0 || npages > GPU_WINDOW_MAX_PAGES {
+    if list_phys == PhysAddr::null() || !list_phys.is_page_aligned()
+        || npages == 0 || npages > GPU_WINDOW_MAX_PAGES {
         log::warn!("GPU window registration rejected: list {:#x?}, {} pages",
                    list_phys, npages);
         return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ARGS);
@@ -245,8 +255,13 @@ pub fn register_heap(params: &mut RequestParams) -> Result<(), MonitorError> {
     let engine = params.r8 as usize;
     let offset = params.r9 as usize;
     use crate::process_manager::reject;
-    if list_phys == PhysAddr::null() || npages == 0 || npages > 512
-        || offset + npages > GPU_HEAP_MAX_PAGES {
+    /* `offset + npages` overflowed BEFORE this test could reject it
+       (overflow-checks are on in the shipping dev profile) - checked
+       add first. The list page is also mapped below, so an unaligned
+       address would panic inside the SVSM's create_4k assert. */
+    if list_phys == PhysAddr::null() || !list_phys.is_page_aligned()
+        || npages == 0 || npages > 512
+        || offset.checked_add(npages).map_or(true, |e| e > GPU_HEAP_MAX_PAGES) {
         log::warn!("GPU heap registration rejected: list {:#x?}, {} pages at {}",
                    list_phys, npages, offset);
         return reject(params, crate::process_manager::STATUS_BAD_ARGS);
@@ -385,6 +400,18 @@ pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
     let core = params.r8 as usize;
     let id = if core < 64 { core } else { get_apic_id() as usize };
     log::warn!("Registraton: {:#x?} {:#x?} core {}", page_table, comm_page, id);
+
+    /* Neither page was validated, and the panic lands LATER on the
+       donated core (poll_engine maps the comm page), long after this
+       call returned - the worst kind to debug. Reject here instead. */
+    let comm = PhysAddr::from(comm_page);
+    if comm.is_null() || !comm.is_page_aligned()
+        || !PhysAddr::from(page_table).is_page_aligned() {
+        log::warn!("GPU engine registration rejected: comm {:#x?}, page table {:#x?}",
+                   comm, PhysAddr::from(page_table));
+        return crate::process_manager::reject(
+            params, crate::process_manager::STATUS_BAD_ARGS);
+    }
 
     reclaim_retired_engine_page(id);
     unsafe {

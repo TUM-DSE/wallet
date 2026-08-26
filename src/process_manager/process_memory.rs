@@ -252,9 +252,29 @@ impl ProcessMemConfig{
         tmp
     }
 
+    /// Pages still obtainable: free list + what is left of the bump
+    /// region. Guest-driven allocations size themselves from guest
+    /// numbers, so their entry points pre-flight against this rather
+    /// than discovering exhaustion mid-build.
+    pub fn pages_available(&self) -> u64 {
+        let base = self.page_base.bits() as u64;
+        let limit = self.page_limit.bits() as u64;
+        let bump = if limit > base { (limit - base) / PAGE_SIZE as u64 } else { 0 };
+        bump + self.free_page_list_used_len as u64
+    }
+
     pub fn get_free_page(&mut self) -> PhysAddr {
         let mut addr = self.check_for_free_page();
         if addr == PhysAddr::null() {
+            /* page_limit was recorded at init and never consulted: the
+               bump pointer walked past the region and validate_and_clear
+               panicked on the pvalidate one page later. Return the
+               "no page" sentinel check_for_free_page already uses. */
+            if self.page_base.bits() as u64 + PAGE_SIZE as u64 > self.page_limit.bits() as u64 {
+                log::error!("get_free_page: monitor memory region exhausted at {:#x?}",
+                            self.page_base);
+                return PhysAddr::null();
+            }
             addr = PhysAddr::from(self.page_base);
             ProcessMemConfig::validate_and_clear(u64::from(addr));
             self.page_base = self.page_base + PAGE_SIZE;
@@ -303,6 +323,13 @@ pub fn preallocate_memory() {
 
 pub fn allocate_page() -> PhysAddr {
     PROCESS_MEM_CONFIG.lock().get_free_page()
+}
+
+/// Pages the monitor can still hand out. Guest-facing handlers use
+/// this to reject an oversized request up front instead of failing
+/// (or panicking) partway through building it.
+pub fn pages_available() -> u64 {
+    PROCESS_MEM_CONFIG.lock().pages_available()
 }
 
 /// A page usable as a guest VMSA. KVM's sev_snp_ap_creation REJECTS

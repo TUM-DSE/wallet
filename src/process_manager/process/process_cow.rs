@@ -198,12 +198,28 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
 
             // We get the Zygote ID from the guest
             // Each Trustlet requires one Zygote
+            /* Validate the parent BEFORE dublicate(): it indexes the
+               store unchecked (OOB = monitor panic) and never inspects
+               process_type, so an in-range non-Zygote slot was worse
+               than an OOB one - an empty slot has a null page table and
+               a null VMSA, and init() would copy 512 entries of guest
+               physical page 0 into the new PML4 and a whole VMSA (with
+               its cr3) out of it, i.e. a guest-chosen CR3 the monitor
+               then writes page tables through.
+               The old `process_type == Undefined` check below could
+               never fire: dublicate hard-codes Trustlet. */
+            if params.r9 as usize >= PROCESS_STORE.len() {
+                log::warn!("create trustlet: zygote id {} out of range", params.r9);
+                return reject(params, crate::process_manager::STATUS_BAD_ID);
+            }
             let zygote_id = ProcessID(params.r9 as usize);
-
+            if PROCESS_STORE.get(zygote_id).process_type != TrustedProcessType::Zygote {
+                log::warn!("create trustlet: process {} is not a zygote", params.r9);
+                return reject(params, crate::process_manager::STATUS_BAD_ID);
+            }
 
             let trustlet = TrustedProcess::trustlet(zygote_id, process_addr, size, guest_pgt);
 
-            // The creation process might fail
             if trustlet.process_type == TrustedProcessType::Undefined {
                 return reject(params, crate::process_manager::STATUS_REJECTED);
             }

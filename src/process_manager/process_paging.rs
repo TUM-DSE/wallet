@@ -786,11 +786,21 @@ impl ProcessPageTableRef {
     }
 
 
+    /// Round a guest-supplied size up to a page boundary WITHOUT
+    /// overflowing: the old `size + (PAGE - size % PAGE)` panics in the
+    /// dev profile (overflow-checks are on in the shipping build) for
+    /// sizes near u64::MAX, and wraps to a tiny value in release.
+    /// Callers pre-flight the resulting page count against
+    /// process_memory::pages_available().
+    pub fn page_round_up(size: u64) -> u64 {
+        size.saturating_add(PAGE_SIZE_4K - (size % PAGE_SIZE_4K))
+    }
+
     /// Takes the page table of the guest OS and copies the
     /// specified starteding from addr and edning at addr + size * pagesize
     /// into a AllocationRange in the Monitor
     pub fn copy_data_from_guest(addr: u64, size: u64, page_table: u64) -> (VirtAddr, AllocationRange){
-        let copy_size = size + (PAGE_SIZE_4K - size % PAGE_SIZE_4K); //Extend size ot full page size
+        let copy_size = Self::page_round_up(size); //Extend size ot full page size
         let copy_page_count = copy_size / PAGE_SIZE_4K;
         let mut alloc_range = AllocationRange(0,0);
 
@@ -806,7 +816,7 @@ impl ProcessPageTableRef {
     }
 
     pub fn copy_data_from_guest2(addr: u64, size: u64, page_table: u64) -> (VirtAddr, AllocationRange){
-        let copy_size = size + (PAGE_SIZE_4K - size % PAGE_SIZE_4K); //Extend size ot full page size
+        let copy_size = Self::page_round_up(size); //Extend size ot full page size
         let copy_page_count = copy_size / PAGE_SIZE_4K;
         let mut alloc_range = AllocationRange(0,0);
 
