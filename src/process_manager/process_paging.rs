@@ -1107,6 +1107,23 @@ impl ProcessPageTableRef {
         }
     }
 
+    /// Zero one PML4 entry. Used right after copy_pgd to drop a copied
+    /// slot before building a private replacement (channel
+    /// privatization, F4). No flush: the table is not live in any cr3
+    /// yet at the only call sites.
+    pub fn clear_pgd_slot(&self, idx: usize) {
+        let (_mapping, table) = paddr_as_u64_slice!(self.process_page_table);
+        table[idx] = 0;
+    }
+
+    /// Is one PML4 entry populated? Finalize tripwire (F4): slots 8/9
+    /// present at finalize time would get their SHARED subtree flags
+    /// rewritten for every user of the model store / GPU mappings.
+    pub fn pgd_present(&self, idx: usize) -> bool {
+        let (_mapping, table) = paddr_as_u64_slice!(self.process_page_table);
+        table[idx] != 0
+    }
+
     /// Phase-0 instrumentation (PLAN.md burn-in plan): log the PML4
     /// slots the monitor writes after cloning - 5/6 (channels),
     /// 8 (model store), 9 (GPU comm/window/heap). Called at clone, at
@@ -1221,18 +1238,49 @@ impl ProcessPageTableRef {
         return false;
     }
 
-    pub fn delete(self, keep: &[VirtAddr]) {
-        // todo: CoW pages deletion logic
-
+    /// Tear down this process page table and return its pages to the
+    /// allocator (F4, PLAN.md).
+    ///
+    /// * `keep` — leaf pages never freed (monitor-global idt/gdt/tss/
+    ///   #PF-entry pages mapped by setup_exceptions). Load-bearing in
+    ///   BOTH modes: with `cow_descend` those slots are walked, and
+    ///   freeing them would put monitor .text into the pool, where the
+    ///   next allocator pop zero-fills it.
+    /// * `cow_descend` — false for trustlets: a CoW entry means "the
+    ///   zygote owns this", skip. True for zygotes: finalize marked
+    ///   everything CoW, and delete_trusted_process guarantees no
+    ///   trustlet sharers remain, so CoW subtrees are zygote-owned and
+    ///   reclaimable.
+    /// * `skip_slots` — PML4 slots cleared but not walked: channel
+    ///   slots shared with a living peer via create_channel. Slots 8
+    ///   (model store) and 9 (GPU comm/window/heap — partly guest-
+    ///   pinned physical pages) are ALWAYS skipped: they are foreign
+    ///   mappings, walking them frees other owners' memory (the F3
+    ///   adoption lesson).
+    ///
+    /// Every freed page (leaves and table pages alike — both were
+    /// granted VMPL1 when mapped) goes through revoke_and_free so no
+    /// page re-enters the pool with dangling VMPL1..3 grants.
+    pub fn delete(self, keep: &[VirtAddr], cow_descend: bool, skip_slots: &[usize]) {
+        let mut total: u64 = 0;
         let (_mapping, pgd_table) = paddr_as_table!(self.process_page_table);
         for i in 0..512 {
             let pgd_table_entry = pgd_table[i];
             if !pgd_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
                 continue;
             }
-            if pgd_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
+            if i == 8 || i == 9 || skip_slots.contains(&i) {
+                log::debug!("delete: skipping foreign/shared PML4[{}]", i);
                 continue;
             }
+            if !cow_descend && pgd_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
+                continue;
+            }
+            if pgd_table_entry.flags().contains(ProcessPageFlags::HUGE_PAGE) {
+                log::warn!("delete: huge entry at PML4[{}], skipping (walk is 4k-only)", i);
+                continue;
+            }
+            let mut slot_freed: u64 = 0;
 
             let (_mapping, pud_table) = paddr_as_table!(strip_paddr!(pgd_table_entry.0));
             for j in 0..512 {
@@ -1240,7 +1288,11 @@ impl ProcessPageTableRef {
                 if !pud_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
                     continue;
                 }
-                if pgd_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
+                if !cow_descend && pud_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
+                    continue;
+                }
+                if pud_table_entry.flags().contains(ProcessPageFlags::HUGE_PAGE) {
+                    log::warn!("delete: huge entry at PML4[{}] PUD[{}], skipping", i, j);
                     continue;
                 }
 
@@ -1250,7 +1302,11 @@ impl ProcessPageTableRef {
                     if !pmd_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
                         continue;
                     }
-                    if pgd_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
+                    if !cow_descend && pmd_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
+                        continue;
+                    }
+                    if pmd_table_entry.flags().contains(ProcessPageFlags::HUGE_PAGE) {
+                        log::warn!("delete: huge entry at PML4[{}] PUD[{}] PMD[{}], skipping", i, j, k);
                         continue;
                     }
 
@@ -1260,7 +1316,7 @@ impl ProcessPageTableRef {
                         if !pte_table_entry.flags().contains(ProcessPageFlags::PRESENT) {
                             continue;
                         }
-                        if pgd_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
+                        if !cow_descend && pte_table_entry.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
                             continue;
                         }
 
@@ -1273,14 +1329,54 @@ impl ProcessPageTableRef {
                             }
                         }
 
-                        free_page(strip_paddr!(pte_table_entry.0));
+                        revoke_and_free(strip_paddr!(pte_table_entry.0));
+                        slot_freed += 1;
                     }
-                    free_page(strip_paddr!(pmd_table_entry.0));
+                    /* The table pages themselves are only ours when we
+                       own the subtree. Without cow_descend, a non-CoW
+                       PMD/PTE table under a walked slot is trustlet-
+                       private (handle_cow privatized it) — but a CoW
+                       one belongs to the zygote and was skipped above,
+                       so reaching here means the entry was walked and
+                       the table is ours to free. */
+                    revoke_and_free(strip_paddr!(pmd_table_entry.0));
+                    slot_freed += 1;
                 }
-                free_page(strip_paddr!(pud_table_entry.0));
+                revoke_and_free(strip_paddr!(pud_table_entry.0));
+                slot_freed += 1;
             }
-            free_page(strip_paddr!(pgd_table_entry.0));
+            revoke_and_free(strip_paddr!(pgd_table_entry.0));
+            slot_freed += 1;
+            total += slot_freed;
+            log::info!("delete: PML4[{}] freed {} pages (leaves+tables)", i, slot_freed);
         }
         free_page(self.process_page_table);
+        total += 1;
+        log::info!("delete: cr3 {:?} total {} pages freed (cow_descend={})",
+                   self.process_page_table, total, cow_descend);
+    }
+}
+
+/// Revoke all guest-VMPL access (and the RMP VMSA attribute) from a
+/// monitor-owned page, then return it to the free list. On revoke
+/// failure the page is LEAKED, deliberately: freeing a page with a
+/// live VMSA bit or dangling grant trades a bounded leak for
+/// corruption (the allocator's pop path writes to the page).
+pub fn revoke_and_free(paddr: PhysAddr) {
+    if paddr == PhysAddr::null() {
+        return;
+    }
+    let mapping = match PerCPUPageMappingGuard::create_4k(paddr) {
+        Ok(m) => m,
+        Err(_) => {
+            log::error!("revoke_and_free: cannot map {:?}, leaking page", paddr);
+            return;
+        }
+    };
+    match crate::sev::utils::rmp_revoke_all_guest_access(mapping.virt_addr(), PageSize::Regular) {
+        Ok(()) => free_page(paddr),
+        Err(e) => {
+            log::error!("revoke_and_free: RMPADJUST failed for {:?} ({:?}), leaking page", paddr, e);
+        }
     }
 }

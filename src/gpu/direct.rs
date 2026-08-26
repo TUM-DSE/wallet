@@ -34,6 +34,15 @@ const _: () = assert!(core::mem::size_of::<CommunicationPage>() == 4096);
 
 static mut ENGINE_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
 
+/// Monitor-allocated comm page of a DEAD trustlet session on this
+/// core, awaiting reclamation (F4). Freeing it inside free_engine_slot
+/// would race the donated-core poller, which only notices the nulled
+/// ENGINE_PAGES entry on its next iteration - so the free is deferred
+/// to the next engine registration on the core, by which point the
+/// poller has long gone idle. Guest-client pages are never stashed
+/// here: those are guest memory, not the monitor's to free.
+static mut RETIRED_ENGINE_PAGE: [PhysAddr; 64] = [PhysAddr::null(); 64];
+
 static mut ENGINE_PAGE_TABLE: [PhysAddr; 64] = [PhysAddr::null(); 64];
 
 /// Fallback service page: one service process serving whichever engine
@@ -382,6 +391,7 @@ pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
     let id = if core < 64 { core } else { get_apic_id() as usize };
     log::warn!("Registraton: {:#x?} {:#x?} core {}", page_table, comm_page, id);
 
+    reclaim_retired_engine_page(id);
     unsafe {
         ENGINE_PAGE_TABLE[id] = PhysAddr::from(page_table);
         ENGINE_PAGES[id] = PhysAddr::from(comm_page);
@@ -407,10 +417,32 @@ pub fn free_engine_slot(core: usize) {
         return;
     }
     unsafe {
+        /* Trustlet sessions use a monitor-allocated comm page - stash
+           it for deferred reclamation (see RETIRED_ENGINE_PAGE). A
+           still-stashed page from an earlier session stays leaked
+           rather than freed here: same poller race. */
+        if ENGINE_IS_TRUSTLET[core] && RETIRED_ENGINE_PAGE[core] == PhysAddr::null() {
+            RETIRED_ENGINE_PAGE[core] = ENGINE_PAGES[core];
+        }
         ENGINE_PAGES[core] = PhysAddr::null();
         HEAP_MAPPED[core] = 0;
     }
     log::warn!("engine slot {} freed (owner died)", core);
+}
+
+/// Free the previous trustlet session's comm page on `core`, if one is
+/// pending. Called from both registration paths: by now the poller has
+/// observed the nulled slot, so no one dereferences the old page.
+fn reclaim_retired_engine_page(core: usize) {
+    if core >= 64 {
+        return;
+    }
+    let retired = unsafe { RETIRED_ENGINE_PAGE[core] };
+    if retired != PhysAddr::null() {
+        unsafe { RETIRED_ENGINE_PAGE[core] = PhysAddr::null(); }
+        crate::process_manager::process_paging::revoke_and_free(retired);
+        log::info!("gpu: reclaimed retired comm page {:?} on core {}", retired, core);
+    }
 }
 
 /// True when a client comm page is registered for `core`. Used by the
@@ -423,6 +455,7 @@ pub fn engine_registered(core: usize) -> bool {
 /// `core`'s engine slot — same slot and polling as a guest client's
 /// page registered via register_engine.
 pub fn register_engine_page(core: usize, page: PhysAddr, page_table: PhysAddr) {
+    reclaim_retired_engine_page(core);
     unsafe {
         ENGINE_PAGES[core] = page;
         /* The bulk path translates client source addresses itself, so it

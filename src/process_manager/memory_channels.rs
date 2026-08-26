@@ -18,6 +18,11 @@ pub struct MemoryChannel {
     /// Option, not a bare ProcessID: process id 0 is a real process, so
     /// there is no free sentinel value for "not linked".
     pub next: Option<ProcessID>,
+    /// Set by create_channel on the CONSUMER: its PML4 slot 5 was
+    /// re-pointed at the producer's output subtree, so the input range
+    /// is borrowed, not owned. Process teardown must not walk slot 5
+    /// then (F4) - freeing it would free the producer's live pages.
+    pub input_borrowed: bool,
 }
 
 #[allow(dead_code)]

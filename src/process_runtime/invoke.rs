@@ -76,6 +76,13 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
             params.rcx = super::TrustletReturnType::ERROR as u64;
             return Ok(());
         }
+        /* Two vCPUs inside one VMSA is undefined behavior; also the
+           gate that makes delete-while-idle safe (F4). */
+        if target.running {
+            log::warn!("invoke_trustlet: trustlet {} is already running", id);
+            params.rcx = super::TrustletReturnType::ERROR as u64;
+            return Ok(());
+        }
     }
 
     // Get the invoke_data given from the guest
@@ -257,12 +264,14 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     _ = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
 
+    rc.process.running = true;
     loop {
         switch_to_vmpl(TRUSTLET_VMPL);
         if !rc.handle_process_request() {
             break;
         }
     }
+    rc.process.running = false;
     //params.rcx = rc.return_value;
     INVOKES_IN_FLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
     breakdown_outb(214);

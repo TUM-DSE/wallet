@@ -90,6 +90,13 @@ pub fn run_nested(ctx: &mut PALContext, callee_id: u64) -> i64 {
             log::warn!("call_trustlet: {} has exited or faulted", callee_id);
             return -1;
         }
+        if callee.running {
+            /* A concurrent caller (another vCPU) is inside this
+               callee - two vCPUs on one VMSA is undefined behavior.
+               The CALL_STACK cycle check only covers this vCPU. */
+            log::warn!("call_trustlet: {} is already running", callee_id);
+            return -1;
+        }
 
         let depth = unsafe { CALL_DEPTH };
         if depth >= MAX_CALL_DEPTH {
@@ -153,12 +160,14 @@ pub fn run_nested(ctx: &mut PALContext, callee_id: u64) -> i64 {
 
         /* Same loop invoke_trustlet runs, one level down. It ends when
            the callee yields (get_result) or exits. */
+        callee_ctx.process.running = true;
         loop {
             switch_to_vmpl(TRUSTLET_VMPL);
             if !callee_ctx.handle_process_request() {
                 break;
             }
         }
+        callee_ctx.process.running = false;
 
         unsafe { CALL_DEPTH = depth; }
 

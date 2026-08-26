@@ -10,7 +10,7 @@ use crate::process_manager::allocation::AllocationRange;
 use alloc::vec::Vec;
 use crate::process_runtime::process::mmap::MmapManager;
 use crate::process_manager::exception_handling::gdt_trustlet;
-use crate::process_manager::process_memory::free_page;
+use crate::process_manager::process_paging::revoke_and_free;
 use crate::process_manager::exception_handling::tss_trustlet;
 use crate::process_manager::exception_handling::asm_entry_trustlet_pf;
 use crate::process_manager::exception_handling::gdt_desc;
@@ -153,7 +153,10 @@ impl Default for ProcessBaseContext {
   }
 }
 
-#[derive(Clone,Debug)]
+/* No Clone: Drop now frees the process page table and VMSA (F4).
+   A cloned-and-dropped TrustedProcess would free a LIVE process's
+   memory - make that unrepresentable. */
+#[derive(Debug)]
 pub struct TrustedProcess {
     pub process_type: TrustedProcessType,
     pub id: u64,
@@ -177,6 +180,13 @@ pub struct TrustedProcess {
     /// gpu_channel; -1 = none. Freed when the trustlet dies so the
     /// core is reusable without the replacement fallback.
     pub gpu_core: i64,
+    /// True while a vCPU is inside this trustlet's execution loop
+    /// (invoke_trustlet or a nested call_trustlet). Deletion requires
+    /// !running: an idle trustlet's VMSA is not loaded and no walk of
+    /// its page table is in flight, so teardown is safe even if it
+    /// never exited (F4 - session trustlets park between invokes and
+    /// are deleted while idle-alive).
+    pub running: bool,
 }
 
 impl ProcessBaseContext {
@@ -242,9 +252,27 @@ impl TrustedProcess {
             infer_context: inf,
             dead: false,
             gpu_core: -1,
+            running: false,
         }
 
     }
+}
+
+/// Leaf pages the page-table teardown must never free: monitor-global
+/// idt/gdt/tss/#PF-entry pages that setup_exceptions maps into EVERY
+/// process page table. Load-bearing for the zygote's cow_descend walk
+/// (F4): finalize runs after setup_exceptions, so these are CoW-marked
+/// in the zygote PT and would otherwise be walked and freed - putting
+/// monitor .text/.data into the pool, where the allocator's pop path
+/// zero-fills it.
+fn exception_keep_list() -> [VirtAddr; 5] {
+    [
+        idt_trustlet().base_limit().0.into(),
+        (asm_entry_trustlet_pf as u64).into(),
+        unsafe { &gdt_desc as *const u8 as u64 }.into(),
+        tss_trustlet().base().into(),
+        gdt_trustlet().base_limit().0.into(),
+    ]
 }
 
 impl Drop for TrustedProcess {
@@ -252,20 +280,45 @@ impl Drop for TrustedProcess {
         match self.process_type {
             TrustedProcessType::Undefined => {}
             TrustedProcessType::Zygote => {
-                self.base.page_table_ref.delete(&[]);
-                // self.context is empty for zygotes
+                /* cow_descend: finalize CoW-marked the whole zygote PT,
+                   and delete_trusted_process guarantees no trustlet
+                   sharers remain, so the CoW subtrees are exclusively
+                   zygote-owned - this is where the ~600 MB per zygote
+                   comes back (F4, PLAN.md). */
+                self.base.page_table_ref.delete(&exception_keep_list(), true, &[]);
+                /* The old "context is empty for zygotes" claim was
+                   false: early_init allocates the zygote VMSA the
+                   trustlet VMSAs are cloned from. revoke_and_free
+                   clears the RMP VMSA attribute before the free -
+                   mandatory, the allocator writes to popped pages. */
+                revoke_and_free(self.context.vmsa);
             }
             TrustedProcessType::Trustlet => {
+                /* Channel slots shared with a LIVING peer trustlet via
+                   create_channel must not be walked: slot 5 if our
+                   input was adopted from the producer's output, slot 6
+                   if our output feeds a consumer (which aliases it as
+                   its slot 5). The shared subtree is reclaimed with
+                   whichever end still owns it exclusively; a linked
+                   pair thus leaks the link subtree - bounded, logged,
+                   accepted for now (PLAN.md F4). */
+                let mut skip = [0usize; 2];
+                let mut n = 0;
+                if self.context.channel.input_borrowed {
+                    skip[n] = 5;
+                    n += 1;
+                }
+                if self.context.channel.next.is_some() {
+                    skip[n] = 6;
+                    n += 1;
+                }
                 // do not delete self.base as this belongs to the zygote
-                self.context.page_table_ref.delete(&[
-                    idt_trustlet().base_limit().0.into(),
-                    (asm_entry_trustlet_pf as u64).into(),
-                    unsafe { &gdt_desc as *const u8 as u64 }.into(),
-                    tss_trustlet().base().into(),
-                    gdt_trustlet().base_limit().0.into()
-                ]); // nothing else for now
-                free_page(self.context.vmsa);
-                // input and output channels are deleted as part of page_table_ref
+                self.context.page_table_ref.delete(&exception_keep_list(), false, &skip[..n]);
+                /* Clears the VMSA RMP attribute, then frees. The LIFO
+                   allocator makes immediate reuse of this page the
+                   common case, so the clear-before-free ordering is
+                   the single most load-bearing line of F4. */
+                revoke_and_free(self.context.vmsa);
             }
         }
     }
@@ -285,6 +338,7 @@ impl TrustedProcess {
             infer_context: AllocationRange(0,0),
             dead: false,
             gpu_core: -1,
+            running: false,
         }
     }
 }

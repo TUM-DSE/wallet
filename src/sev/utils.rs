@@ -29,6 +29,11 @@ pub enum SevSnpError {
     FAIL_INPUT(u64),
     FAIL_PERMISSION(u64),
     FAIL_SIZEMISMATCH(u64),
+    /// RMPADJUST ret 3: the target is an in-use VMSA. Reachable when
+    /// clearing the VMSA attribute of a page some vCPU still runs -
+    /// process teardown must treat this as "abort the free", never
+    /// as unreachable.
+    FAIL_INUSE(u64),
     // Not a real error value, but we want to keep track of this,
     // especially for protocol-specific messaging
     FAIL_UNCHANGED(u64),
@@ -44,6 +49,7 @@ impl fmt::Display for SevSnpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FAIL_INPUT(_) => write!(f, "FAIL_INPUT"),
+            Self::FAIL_INUSE(_) => write!(f, "FAIL_INUSE"),
             Self::FAIL_UNCHANGED(_) => write!(f, "FAIL_UNCHANGED"),
             Self::FAIL_PERMISSION(_) => write!(f, "FAIL_PERMISSION"),
             Self::FAIL_SIZEMISMATCH(_) => write!(f, "FAIL_SIZEMISMATCH"),
@@ -151,6 +157,7 @@ pub fn rmp_adjust(addr: VirtAddr, flags: RMPFlags, size: PageSize) -> Result<(),
         0 => Ok(()),
         1 => Err(SevSnpError::FAIL_INPUT(ret).into()),
         2 => Err(SevSnpError::FAIL_PERMISSION(ret).into()),
+        3 => Err(SevSnpError::FAIL_INUSE(ret).into()),
         6 => Err(SevSnpError::FAIL_SIZEMISMATCH(ret).into()),
         _ => {
             log::error!("RMPADJUST: Unexpected return value: {:#x}", ret);
@@ -161,6 +168,21 @@ pub fn rmp_adjust(addr: VirtAddr, flags: RMPFlags, size: PageSize) -> Result<(),
 
 pub fn rmp_revoke_guest_access(vaddr: VirtAddr, size: PageSize) -> Result<(), SvsmError> {
     for vmpl in RMPFlags::GUEST_VMPL.bits()..=RMPFlags::VMPL3.bits() {
+        let vmpl = RMPFlags::from_bits_truncate(vmpl);
+        rmp_adjust(vaddr, vmpl | RMPFlags::NONE, size)?;
+    }
+    Ok(())
+}
+
+/// Revoke VMPL1..=VMPL3 access AND clear the RMP VMSA attribute (the
+/// rdx VMSA bit is 0 on every call). Wallet-local equivalent of core
+/// SVSM's rmp_clear_guest_vmsa. Required before any process page -
+/// a VMSA page above all - re-enters the free list: the allocator
+/// zero-fills on pop, and a write to a still-VMSA-flagged page RMP-
+/// faults. Note rmp_revoke_guest_access above starts at GUEST_VMPL=2
+/// and never touches VMPL1, which is what process pages are granted.
+pub fn rmp_revoke_all_guest_access(vaddr: VirtAddr, size: PageSize) -> Result<(), SvsmError> {
+    for vmpl in RMPFlags::VMPL1.bits()..=RMPFlags::VMPL3.bits() {
         let vmpl = RMPFlags::from_bits_truncate(vmpl);
         rmp_adjust(vaddr, vmpl | RMPFlags::NONE, size)?;
     }

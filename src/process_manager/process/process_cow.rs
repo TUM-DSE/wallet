@@ -101,6 +101,7 @@ impl TrustedProcess {
             pf_target_vaddr: 0,
             dead: false,
             gpu_core: -1,
+            running: false,
             infer_context: AllocationRange(0,0),
         }
     }
@@ -211,9 +212,52 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
     }
 }
 
+/* Rejections here MUST be Ok(()) + a -1 status in rcx, never Err:
+   the wallet protocol maps Err to SVSM_ERR_INCOMPLETE, and the guest
+   kernel's svsm_perform_call_protocol retries INCOMPLETE forever - an
+   Err on a guest-reachable path wedges the calling guest CPU in an
+   infinite loop (observed with the F4 bad-pid negative test). */
+fn reject(params: &mut RequestParams) -> Result<(), MonitorError> {
+    params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
+    Ok(())
+}
+
 pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorError> {
+    /* The pid is guest-supplied; get() indexes straight into the Vec,
+       so an unchecked id is a guest-triggerable monitor panic. */
+    if params.rcx as usize >= PROCESS_STORE.len() {
+        log::warn!("delete: pid {} out of range", params.rcx);
+        return reject(params);
+    }
     let process_id = ProcessID(params.rcx as usize);
     let process = PROCESS_STORE.get(process_id);
+
+    /* Deleting an empty slot is a no-op, not an error - double
+       deletes happen when a driver retries after a timeout. */
+    if process.process_type == TrustedProcessType::Undefined {
+        params.rcx = 0;
+        return Ok(());
+    }
+
+    /* A trustlet may be deleted when dead OR idle, but never while a
+       vCPU is inside its execution loop: `running` guards the VMSA we
+       are about to strip the RMP VMSA attribute from and the page
+       table the Drop below frees (F4). Idle-alive deletion is the
+       normal session teardown - trustlets park in get_result between
+       invokes and most never exit. The store slot becomes Undefined
+       on delete, so a later invoke is refused, not resumed. */
+    if process.process_type == TrustedProcessType::Trustlet && process.running {
+        log::warn!("delete: refusing to delete running trustlet {}", process_id.0);
+        return reject(params);
+    }
+
+    /* An idle-alive engine trustlet still owns its GPU engine slot
+       (mark_dead never ran). Release it exactly as mark_dead would;
+       gpu_core >= 0 proves the slot was never handed to a successor. */
+    if process.process_type == TrustedProcessType::Trustlet && process.gpu_core >= 0 {
+        crate::gpu::direct::free_engine_slot(process.gpu_core as usize);
+        process.gpu_core = -1;
+    }
 
     if process.process_type == TrustedProcessType::Zygote {
         for i in 0..PROCESS_STORE_SIZE {
@@ -223,7 +267,8 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorE
             let process = PROCESS_STORE.get(ProcessID(i as usize));
             if process.process_type == TrustedProcessType::Trustlet {
                 if process.parent_id as usize == process_id.0 {
-                    return Err(MonitorError::invalid_params());
+                    log::warn!("delete: zygote {} still has trustlet {}", process_id.0, i);
+                    return reject(params);
                 }
             }
         }
@@ -232,6 +277,7 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorE
     log::info!("allocated memory before deletion of {}: {}", process_id.0, process_memory::allocated_amount());
     PROCESS_STORE.delete(process_id);
     log::info!("allocated memory after deletion: {}", process_memory::allocated_amount());
+    params.rcx = 0;
     Ok(())
 }
 
@@ -314,6 +360,16 @@ impl ProcessContext {
         let mut new_page_table_ref = ProcessPageTableRef::default();
         new_page_table_ref.init_vmpl1();
         new_page_table_ref.copy_pgd(&zygote_context.page_table_ref);
+        /* Privatize the channel slots (F4). copy_pgd copied the
+           zygote's slot 5/6 entries, which finalize left non-CoW - so
+           allocate_input/output below would build this trustlet's
+           channel pages INSIDE the zygote's shared subtrees,
+           overwriting the previous trustlet's mappings (silent leak)
+           and making teardown of slots 5/6 a UAF against the zygote.
+           Cleared here, the channels build fresh trustlet-owned
+           subtrees and die with the trustlet. */
+        new_page_table_ref.clear_pgd_slot(5);
+        new_page_table_ref.clear_pgd_slot(6);
         new_page_table_ref.log_pml4_slots("clone");
         let page_table_ref = new_page_table_ref;
 

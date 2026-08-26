@@ -48,6 +48,11 @@ pub fn create_channel(params: &mut RequestParams) -> Result<(), MonitorError> {
     trustlet2_pgd_table[trustlet2_input_channel_pgd_idx] = target_entry;
 
     trustlet2.context.channel.input = trustlet1.context.channel.output;
+    /* Slot 5 now aliases trustlet1's output subtree - teardown must
+       not walk it (F4). Trustlet2's ORIGINAL input subtree is orphaned
+       here (pre-existing TODO below); it is trustlet2-owned, so a
+       future fix can free it at this point. */
+    trustlet2.context.channel.input_borrowed = true;
 
     // Record where trustlet1's output leads. This is the routing the
     // inference call uses: a trustlet asks for inference and the monitor
