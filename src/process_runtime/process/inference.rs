@@ -143,17 +143,29 @@ pub fn prompt_get(params: &mut RequestParams) -> Result<(), MonitorError> {
     let addr = params.r8;
     let size = params.r9;
 
-    let trustlet = PROCESS_STORE.get(ProcessID(process.try_into().unwrap()));
-
     log::debug!("PromptGet: Addr: {:x}, ID: {}, Table: {:x}, Size: {}",
                 addr, process, page_table, size);
 
+    /* The pid is guest-supplied and get() indexes straight into the
+       Vec - bounds-check BEFORE touching the store. Failure status is
+       rcx = 0 ("0 bytes copied"; the pybind binding raises on it),
+       returned Ok: an Err here maps to SVSM_ERR_INCOMPLETE and wedges
+       the calling guest CPU in the kernel's retry loop. */
+    if process as usize >= PROCESS_STORE.len() {
+        log::warn!("prompt_get: pid {} out of range", process);
+        params.rcx = 0;
+        return Ok(());
+    }
+    let trustlet = PROCESS_STORE.get(ProcessID(process.try_into().unwrap()));
+
     /* Both rejections must come BEFORE any PML4 write - the old order
        mounted first and error-returned with slot 6/7 still populated
-       (the F2/F3 leak family, PLAN.md). */
-    if (addr & 0x7FFFFFFFFF) != 0 || trustlet.infer_context.1 * 4096 < size {
+       (the F2/F3 leak family, PLAN.md). infer_context.1 == 0 also
+       covers empty/never-invoked slots. */
+    if (addr & 0x7FFFFFFFFF) != 0 || trustlet.infer_context.1 == 0
+        || trustlet.infer_context.1 * 4096 < size {
         params.rcx = 0;
-        return Err(MonitorError::invalid_params());
+        return Ok(());
     }
 
     let idx = ((addr >> (9*3)) >> 12) & 0x1FF;
@@ -189,16 +201,23 @@ pub fn response_store(params: &mut RequestParams) -> Result<(), MonitorError> {
     let addr = params.r8;
     let size = params.r9;
 
-    let trustlet = PROCESS_STORE.get(ProcessID(process.try_into().unwrap()));
-
-    log::debug!("PromptGet: Addr: {:x}, ID: {}, Table: {:x}, Size: {}",
+    log::debug!("ResponseStore: Addr: {:x}, ID: {}, Table: {:x}, Size: {}",
                 addr, process, page_table, size);
 
-
-    /* Same ordering fix as prompt_get: reject before any PML4 write. */
-    if (addr & 0x7FFFFFFFFF) != 0 || trustlet.infer_context.1 * 4096 < size {
+    /* Same guards as prompt_get: pid bounds before the store, reject
+       (rcx = 0, Ok) before any PML4 write - never Err on a
+       guest-reachable path. */
+    if process as usize >= PROCESS_STORE.len() {
+        log::warn!("response_store: pid {} out of range", process);
         params.rcx = 0;
-        return Err(MonitorError::invalid_params());
+        return Ok(());
+    }
+    let trustlet = PROCESS_STORE.get(ProcessID(process.try_into().unwrap()));
+
+    if (addr & 0x7FFFFFFFFF) != 0 || trustlet.infer_context.1 == 0
+        || trustlet.infer_context.1 * 4096 < size {
+        params.rcx = 0;
+        return Ok(());
     }
 
     let idx = ((addr >> (9*3)) >> 12) & 0x1FF;

@@ -5,6 +5,8 @@ use crate::process_manager::memory_channels::{INPUT_VADDR, OUTPUT_VADDR};
 use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::process_manager::process::ProcessID;
 use crate::process_manager::PROCESS_STORE;
+use crate::process_manager::reject;
+use crate::process_manager::process::TrustedProcessType;
 use crate::MonitorError;
 use crate::RequestParams;
 use crate::vaddr_as_u64_slice;
@@ -15,10 +17,26 @@ pub fn create_channel(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     log::info!("Creating Channel: tid={} tid={}", tid1, tid2);
 
+    /* Both ids are guest-supplied: bounds-check before indexing the
+       store (OOB = monitor panic), and require live trustlets - an
+       empty slot has a null VMSA and the create_4k unwraps below
+       would panic on it. Rejections are Ok + rcx = -1 (never Err:
+       INCOMPLETE retry wedge); success sets rcx = 0. */
+    if tid1 as usize >= PROCESS_STORE.len() || tid2 as usize >= PROCESS_STORE.len() {
+        log::warn!("create_channel: tid {}/{} out of range", tid1, tid2);
+        return reject(params, crate::process_manager::STATUS_BAD_ID);
+    }
+
     // map tid1's output channel to tid2's input channel
 
     let trustlet1 = PROCESS_STORE.get(ProcessID(tid1.try_into().unwrap()));
     let trustlet2 = PROCESS_STORE.get(ProcessID(tid2.try_into().unwrap()));
+
+    if trustlet1.process_type != TrustedProcessType::Trustlet
+        || trustlet2.process_type != TrustedProcessType::Trustlet {
+        log::warn!("create_channel: tid {}/{} is not a trustlet", tid1, tid2);
+        return reject(params, crate::process_manager::STATUS_BAD_ID);
+    }
 
     let trustlet1_vmsa_paddr = trustlet1.context.vmsa;
     let trustlet1_vmsa_mapping = PerCPUPageMappingGuard::create_4k(trustlet1_vmsa_paddr).unwrap();
@@ -64,5 +82,6 @@ pub fn create_channel(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     // TODO: free trustlet2's old input channel pages
 
+    params.rcx = 0;
     Ok(())
 }

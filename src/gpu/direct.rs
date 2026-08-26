@@ -140,8 +140,7 @@ pub fn register_window(params: &mut RequestParams) -> Result<(), MonitorError> {
     if list_phys == PhysAddr::null() || npages == 0 || npages > GPU_WINDOW_MAX_PAGES {
         log::warn!("GPU window registration rejected: list {:#x?}, {} pages",
                    list_phys, npages);
-        params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-        return Ok(());
+        return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ARGS);
     }
     /* Copy the list into a monitor-owned page: the trustlet mapping
        happens later (gpu_channel), and it must see the registration-
@@ -245,15 +244,12 @@ pub fn register_heap(params: &mut RequestParams) -> Result<(), MonitorError> {
     let npages = params.rdx as usize;
     let engine = params.r8 as usize;
     let offset = params.r9 as usize;
-    let reject = |params: &mut RequestParams| {
-        params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-    };
+    use crate::process_manager::reject;
     if list_phys == PhysAddr::null() || npages == 0 || npages > 512
         || offset + npages > GPU_HEAP_MAX_PAGES {
         log::warn!("GPU heap registration rejected: list {:#x?}, {} pages at {}",
                    list_phys, npages, offset);
-        reject(params);
-        return Ok(());
+        return reject(params, crate::process_manager::STATUS_BAD_ARGS);
     }
     /* Offset 0 resets the slot: a fresh service process registers a
        fresh heap (vmpl.ko already dropped the old pins). Directory
@@ -278,8 +274,7 @@ pub fn register_heap(params: &mut RequestParams) -> Result<(), MonitorError> {
     if offset != current {
         log::warn!("GPU heap registration rejected: offset {} != current {} \
                     (append-only)", offset, current);
-        reject(params);
-        return Ok(());
+        return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
     let dir = unsafe {
         if engine < 64 { HEAP_DIRS[engine] } else { HEAP_DIR_ANY }

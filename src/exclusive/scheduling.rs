@@ -4,6 +4,7 @@ use crate::exclusive::{ControlStruct, VMSA_FEAT, VMSA_PHYS, CONTROL};
 use crate::address::{Address, PhysAddr};
 use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::{MonitorError, RequestParams};
+use crate::process_manager::reject;
 
 use super::{set_next, LOOP_CLEAR, LOOP_EXIT, LOOP_SLEEP, LOOP_WAKEUP};
 
@@ -47,45 +48,65 @@ pub fn wakeup(id: usize) -> u64 {
     return 0;
 }
 
+/* All three entry points below take a guest-supplied core id and were
+   both panic- and wedge-prone: CONTROL/VMSA_PHYS are [_; 64] (index
+   OOB = monitor panic), and any Err maps to SVSM_ERR_INCOMPLETE,
+   which the guest kernel retries forever. Rejections go through
+   reject() (Ok + a negative status class); successes set rcx = 0 so
+   the status the ioctl returns is meaningful. */
 pub fn run_sleep(params: &mut RequestParams) -> Result<(), MonitorError> {
     let id: usize = params.rcx.try_into().unwrap();
+    if id >= 64 {
+        log::warn!("PauseCpu: core id {} out of range", id);
+        return reject(params, crate::process_manager::STATUS_BAD_ID);
+    }
     let ctr_page: PhysAddr = unsafe {
         CONTROL[id]
     };
     if ctr_page.is_null() {
         log::warn!("Control area missing");
-        return Err(MonitorError::invalid_params());
+        return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
     let ctr_mapping = PerCPUPageMappingGuard::create_4k(ctr_page).unwrap();
     let ctr_ptr: *mut ControlStruct = ctr_mapping.virt_addr().as_mut_ptr::<ControlStruct>();
     let ctr = unsafe {&mut *ctr_ptr};
     if ctr.hlt.load(Ordering::Relaxed) == 1 {
         log::warn!("Monitor thread is already asleep");
-        return Err(MonitorError::invalid_params());
+        return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
 
     set_next(&mut ctr.next, LOOP_CLEAR, LOOP_SLEEP);
 
+    params.rcx = 0;
     Ok(())
 }
 
 pub fn run_wakeup(params: &mut RequestParams) -> Result<(), MonitorError> {
     let id: usize = params.rcx.try_into().unwrap();
+    if id >= 64 {
+        log::warn!("RunCpu: core id {} out of range", id);
+        return reject(params, crate::process_manager::STATUS_BAD_ID);
+    }
     if wakeup(id) == 0 {
+        params.rcx = 0;
         return Ok(());
     };
-    return Err(MonitorError::invalid_params());
+    return reject(params, crate::process_manager::STATUS_BAD_STATE);
 }
 
 pub fn run_exit(params: &mut RequestParams) -> Result<(), MonitorError> {
     let id: usize = params.rcx.try_into().unwrap();
+    if id >= 64 {
+        log::warn!("ReturnCpu: core id {} out of range", id);
+        return reject(params, crate::process_manager::STATUS_BAD_ID);
+    }
 
     let vmsa_pa = unsafe {
         VMSA_PHYS[id]
     };
     if vmsa_pa.is_null() {
         log::warn!("Not running in exclusive mode");
-        return Err(MonitorError::invalid_params());
+        return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
 
     let ctr_page: PhysAddr = unsafe {
@@ -93,7 +114,7 @@ pub fn run_exit(params: &mut RequestParams) -> Result<(), MonitorError> {
     };
     if ctr_page.is_null() {
         log::warn!("Control area missing");
-        return Err(MonitorError::invalid_params());
+        return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
     let ctr_mapping = PerCPUPageMappingGuard::create_4k(ctr_page).unwrap();
     let ctr_ptr: *mut ControlStruct = ctr_mapping.virt_addr().as_mut_ptr::<ControlStruct>();
@@ -105,5 +126,6 @@ pub fn run_exit(params: &mut RequestParams) -> Result<(), MonitorError> {
     } else {
         wakeup(id);
     }
+    params.rcx = 0;
     Ok(())
 }

@@ -190,6 +190,12 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
 }
 
 pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorError> {
+    /* Guest-supplied pid: bounds-check before indexing, and reject
+       via Ok + rcx = -1, never Err (INCOMPLETE retry wedge). */
+    if params.rcx as usize >= PROCESS_STORE.len() {
+        log::warn!("delete: pid {} out of range", params.rcx);
+        return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ID);
+    }
     let process_id = ProcessID(params.rcx as usize);
     let process = PROCESS_STORE.get(process_id);
 
@@ -201,7 +207,7 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorE
             let process = PROCESS_STORE.get(ProcessID(i as usize));
             if process.process_type == TrustedProcessType::Trustlet {
                 if process.parent_id as usize == process_id.0 {
-                    return Err(MonitorError::invalid_params());
+                    return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_STATE);
                 }
             }
         }

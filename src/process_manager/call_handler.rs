@@ -91,7 +91,8 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
     //panic!("YEAH");
     use crate::monitor_call_type::MonitorCallType;
     if request > crate::monitor_call_type::MONITOR_CALL_TYPE_MAX_VALUE {
-        return Err(MonitorError::unsupported());
+        log::error!("Unsupported monitor call id {}", request);
+        return crate::process_manager::reject(params, crate::process_manager::STATUS_UNSUPPORTED);
     }
     let call: MonitorCallType = unsafe {core::mem::transmute(request)};
     log::debug!("Montior calle: {:?}", call);
@@ -99,6 +100,12 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
         MonitorCallType::InitMonitor =>
             monitor_init(params),
         MonitorCallType::AttestMonitor =>
+            diff_attestation(params),
+        /* Id 2 is the id the guest actually issues (vmpl.ko's
+           MONITOR_CALL_FUNC_DEF(attest)); AttestMonitor (1) is a
+           guest-side placeholder that never calls. Without this arm
+           Attest fell into the catch-all Err and wedged the vCPU. */
+        MonitorCallType::Attest =>
             diff_attestation(params),
         MonitorCallType::LoadPolicy =>
             Ok(()),
@@ -190,7 +197,11 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
             crate::gpu::direct::register_window(params),
         MonitorCallType::RegisterGpuHeap =>
             crate::gpu::direct::register_heap(params),
-        _ => Err(MonitorError::unsupported()),
+        /* No `_` arm on purpose: the range guard above makes the
+           transmute total over the enum, and exhaustiveness is what
+           catches a regenerated call_type.h id with no handler at
+           compile time - Attest (2) hid in the old catch-all and
+           wedged the guest vCPU via the Err -> INCOMPLETE retry. */
     };
 
     log::debug!("Monitor call finished: {:?}",res);

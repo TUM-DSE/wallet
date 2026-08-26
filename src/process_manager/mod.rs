@@ -26,6 +26,29 @@ static MONITOR_INIT_STATE: ImmutAfterInitCell<bool> = ImmutAfterInitCell::new(fa
 const MONITOR_INIT_STATE_TRUE: bool = true;
 pub const PROCESS_STORE_SIZE: u32 = 64;
 
+/* Guest-visible status classes, mirrored by
+   lib/guest/wallet/include/wallet/monitor_status.h (kept in sync by
+   hand - they are NOT part of the generated call-id enums).
+   Deliberately coarse: they name the CLASS of a failure so the guest
+   can react, never monitor internals. */
+pub const STATUS_REJECTED: i64 = -1;
+pub const STATUS_BAD_ID: i64 = -2;
+pub const STATUS_BAD_STATE: i64 = -3;
+pub const STATUS_BAD_ARGS: i64 = -4;
+pub const STATUS_NO_RESOURCES: i64 = -5;
+pub const STATUS_UNSUPPORTED: i64 = -6;
+
+/* Rejections on guest-reachable paths MUST be Ok(()) + a negative
+   status in rcx, never Err: the wallet protocol maps Err to
+   SVSM_ERR_INCOMPLETE, and the guest kernel's
+   svsm_perform_call_protocol retries INCOMPLETE forever - an Err on a
+   guest-reachable path wedges the calling guest CPU in an infinite
+   loop (observed with the F4 bad-pid negative test). */
+pub fn reject(params: &mut crate::RequestParams, status: i64) -> Result<(), crate::MonitorError> {
+    params.rcx = u64::from_ne_bytes(status.to_ne_bytes());
+    Ok(())
+}
+
 pub fn monitor_init(){
     if *MONITOR_INIT_STATE {
         let _ = additional_monitor_memory_init();

@@ -169,6 +169,13 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
             // Each process is identified with an idea from
             // the store
             let res = PROCESS_STORE.insert(z);
+            /* A full store returns -1; the try_into().unwrap() below
+               panicked on it. NO_RESOURCES keeps the "negative on
+               failure" contract of the create calls. */
+            if res < 0 {
+                log::warn!("create zygote: process store full");
+                return reject(params, crate::process_manager::STATUS_NO_RESOURCES);
+            }
 
             log::debug!("Get ID back from store {res}");
             let z = PROCESS_STORE.get(ProcessID(res.try_into().unwrap()));
@@ -198,11 +205,14 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
 
             // The creation process might fail
             if trustlet.process_type == TrustedProcessType::Undefined {
-                params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-                return Ok(());
-            } 
+                return reject(params, crate::process_manager::STATUS_REJECTED);
+            }
 
             let res = PROCESS_STORE.insert(trustlet);
+            if res < 0 {
+                log::warn!("create trustlet: process store full");
+                return reject(params, crate::process_manager::STATUS_NO_RESOURCES);
+            }
             params.rcx = u64::from_ne_bytes(res.to_ne_bytes());
 
             log::info!("allocated memory after trustlet creation: {}", process_memory::allocated_amount());
@@ -212,22 +222,14 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
     }
 }
 
-/* Rejections here MUST be Ok(()) + a -1 status in rcx, never Err:
-   the wallet protocol maps Err to SVSM_ERR_INCOMPLETE, and the guest
-   kernel's svsm_perform_call_protocol retries INCOMPLETE forever - an
-   Err on a guest-reachable path wedges the calling guest CPU in an
-   infinite loop (observed with the F4 bad-pid negative test). */
-fn reject(params: &mut RequestParams) -> Result<(), MonitorError> {
-    params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-    Ok(())
-}
+use crate::process_manager::reject;
 
 pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorError> {
     /* The pid is guest-supplied; get() indexes straight into the Vec,
        so an unchecked id is a guest-triggerable monitor panic. */
     if params.rcx as usize >= PROCESS_STORE.len() {
         log::warn!("delete: pid {} out of range", params.rcx);
-        return reject(params);
+        return reject(params, crate::process_manager::STATUS_BAD_ID);
     }
     let process_id = ProcessID(params.rcx as usize);
     let process = PROCESS_STORE.get(process_id);
@@ -248,7 +250,7 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorE
        on delete, so a later invoke is refused, not resumed. */
     if process.process_type == TrustedProcessType::Trustlet && process.running {
         log::warn!("delete: refusing to delete running trustlet {}", process_id.0);
-        return reject(params);
+        return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
 
     /* An idle-alive engine trustlet still owns its GPU engine slot
@@ -268,7 +270,7 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), MonitorE
             if process.process_type == TrustedProcessType::Trustlet {
                 if process.parent_id as usize == process_id.0 {
                     log::warn!("delete: zygote {} still has trustlet {}", process_id.0, i);
-                    return reject(params);
+                    return reject(params, crate::process_manager::STATUS_BAD_STATE);
                 }
             }
         }

@@ -363,6 +363,12 @@ fn function_report(params: &mut RequestParams) -> Result<(), MonitorError>{
     allocation.delete();
 
     // Get the parent process of the function
+    /* The id came out of a guest-written struct, not a register - the
+       diff_attestation entry guard cannot see it. */
+    if trustlet_id as usize >= PROCESS_STORE.len() {
+        log::warn!("function attestation: trustlet id {} out of range", trustlet_id);
+        return Err(MonitorError::invalid_params());
+    }
     let trustlet_id = ProcessID(trustlet_id as usize);
     let trustlet = PROCESS_STORE.get(trustlet_id);
 
@@ -420,50 +426,73 @@ fn function_report(params: &mut RequestParams) -> Result<(), MonitorError>{
 
 #[allow(non_snake_case)]
 pub fn diff_attestation(params: &mut RequestParams) -> Result<(), MonitorError>{
-    match params.rdx {
+    /* r8 is a guest-supplied pid for these report types; the report
+       fns index PROCESS_STORE with it unchecked, so an out-of-range
+       id is a guest-triggerable monitor panic. */
+    let needs_pid = matches!(params.rdx,
+        ZYGOTE_ATTESTATION | TRUSTLET_ATTESTATION
+        | PREPARE_ZYGOTE_ATTESTATION_COLD | ZYGOTE_ATTESTATION_COLD
+        | PREPARE_TRUSTLET_ATTESTATION_COLD | TRUSTLET_ATTESTATION_COLD);
+    if needs_pid && params.r8 as usize >= PROCESS_STORE.len() {
+        log::warn!("attestation: pid {} out of range", params.r8);
+        return crate::process_manager::reject(params, crate::process_manager::STATUS_BAD_ID);
+    }
+    let res = match params.rdx {
         MONITOR_ATTESTATION => {
             log::debug!("[Performing monitor attestation]");
-            let _ = monitor_report(params);
+            monitor_report(params)
         }
         ZYGOTE_ATTESTATION => {
             log::debug!("[Performing zygote {} attestation]", params.r8);
-            let _ = zygote_report(params);
+            zygote_report(params)
         }
         TRUSTLET_ATTESTATION => {
             log::debug!("[Performing trustlet {} attestation]", params.r8);
-            let _ = trustlet_report(params);
+            trustlet_report(params)
         }
         FUNCTION_ATTESTATION => {
             log::debug!("[Performing function attestation]");
-            let _ = function_report(params);
+            function_report(params)
         }
         /* helper attestation options for microbenchmarks */
         MONITOR_ATTESTATION_COLD => {
             log::debug!("[Performing monitor cold report generation]");
-            let _ = monitor_report_cold(params);
+            monitor_report_cold(params)
         }
         PREPARE_ZYGOTE_ATTESTATION_COLD => {
             log::debug!("[Preparing zygote {} cold report generation]", params.r8);
-            let _ = prepare_zygote_report_cold(params);
+            prepare_zygote_report_cold(params)
         }
         ZYGOTE_ATTESTATION_COLD => {
             log::debug!("[Performing zygote {} cold report generation]", params.r8);
-            let _ = zygote_report_cold(params);
+            zygote_report_cold(params)
         }
         PREPARE_TRUSTLET_ATTESTATION_COLD => {
             log::debug!("[Preparing trustlet {} cold report generation]", params.r8);
-            let _ = prepare_trustlet_report_cold(params);
+            prepare_trustlet_report_cold(params)
         }
         TRUSTLET_ATTESTATION_COLD => {
             log::debug!("[Performing trustlet {} cold report generation]", params.r8);
-            let _ = trustlet_report_cold(params);
+            trustlet_report_cold(params)
         }
         /* end of helper attestation options for microbenchmarks */
         _ => {
             log::info!("[Unknown attestation request type]");
+            return crate::process_manager::reject(params, crate::process_manager::STATUS_UNSUPPORTED);
         }
+    };
+    match res {
+        /* rcx carried the guest report buffer on the way in and is not
+           an output; return a clean 0 status (the vmpl.ko attest
+           wrapper returns rcx_out). */
+        Ok(()) => { params.rcx = 0; Ok(()) }
+        /* Today the only Err source is function_report's id check. */
+        Err(e) => crate::process_manager::reject(params, match e.0 {
+            crate::MonitorErrorType::InvalidParameters =>
+                crate::process_manager::STATUS_BAD_ID,
+            _ => crate::process_manager::STATUS_REJECTED,
+        }),
     }
-    return Ok(());
 }
 
 #[allow(non_snake_case)]
@@ -483,8 +512,11 @@ pub fn get_public_key(params: &mut RequestParams) -> Result<(), MonitorError> {
         i = i + 1;
     }   
     target[KEY_SIZE] = 0;
-   
-  Ok(())  
+
+    /* Clean 0 status: the vmpl.ko wrapper returns rcx_out, and rcx
+       carried the target page address on the way in. */
+    params.rcx = 0;
+    Ok(())
 }
 
 // TODO: For now monitor just receives the policy here and decrypts it. Probablly want to do more with it!
@@ -505,6 +537,8 @@ pub fn send_policy(params: &mut RequestParams) -> Result<(), MonitorError> {
     let _n: u32 = unsafe{decrypt(decrypted.as_mut_ptr(), encrypted_data.as_mut_ptr(),
                                 encrypted_data_size , nonce.as_mut_ptr(),
                                 sender_pub_key.as_mut_ptr(), (*get_keys()).private_key.as_mut_ptr())};
+    /* Clean 0 status, as in get_public_key. */
+    params.rcx = 0;
     Ok(())
 }
 
