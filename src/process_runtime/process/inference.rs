@@ -1,5 +1,4 @@
 use crate::address::VirtAddr;
-use crate::interop::memory::flush_tlb_global;
 use crate::interop::memory::read_cr3;
 use crate::model_store::ENGINE_STORE;
 use crate::model_store::LORA_STORE;
@@ -149,7 +148,10 @@ pub fn prompt_get(params: &mut RequestParams) -> Result<(), MonitorError> {
     log::debug!("PromptGet: Addr: {:x}, ID: {}, Table: {:x}, Size: {}",
                 addr, process, page_table, size);
 
-    if (addr & 0x7FFFFFFFFF) != 0 {
+    /* Both rejections must come BEFORE any PML4 write - the old order
+       mounted first and error-returned with slot 6/7 still populated
+       (the F2/F3 leak family, PLAN.md). */
+    if (addr & 0x7FFFFFFFFF) != 0 || trustlet.infer_context.1 * 4096 < size {
         params.rcx = 0;
         return Err(MonitorError::invalid_params());
     }
@@ -162,19 +164,19 @@ pub fn prompt_get(params: &mut RequestParams) -> Result<(), MonitorError> {
     let idx2 = 7;
     let (_mapping, pgd) = paddr_as_slice!(read_cr3());
     pgd[idx2] = pgd_entry;
-    flush_tlb_global();
+    /* No standalone flush: the mount() below flushes globally. */
 
     trustlet.infer_context.mount();
-
-    if trustlet.infer_context.1 * 4096 < size{
-        params.rcx = 0;
-        return Err(MonitorError::invalid_params());
-    }
 
     let src = 0x30000000000u64 as *const u8;
     let dst = 0x38000000000u64 as *mut u8;
 
     unsafe { core::ptr::copy(src, dst, size.try_into().unwrap()) };
+
+    /* Balanced teardown: slot 7 is a borrowed guest subtree - just
+       unlink it; unmount() zeroes slot 6 and its flush covers both. */
+    pgd[idx2] = 0;
+    trustlet.infer_context.unmount();
 
     params.rcx = size;
 
@@ -193,7 +195,8 @@ pub fn response_store(params: &mut RequestParams) -> Result<(), MonitorError> {
                 addr, process, page_table, size);
 
 
-    if (addr & 0x7FFFFFFFFF) != 0 {
+    /* Same ordering fix as prompt_get: reject before any PML4 write. */
+    if (addr & 0x7FFFFFFFFF) != 0 || trustlet.infer_context.1 * 4096 < size {
         params.rcx = 0;
         return Err(MonitorError::invalid_params());
     }
@@ -205,19 +208,18 @@ pub fn response_store(params: &mut RequestParams) -> Result<(), MonitorError> {
     let idx2 = 7;
     let (_mapping, pgd) = paddr_as_slice!(read_cr3());
     pgd[idx2] = pgd_entry;
-    flush_tlb_global();
+    /* No standalone flush: the mount() below flushes globally. */
 
     trustlet.infer_context.mount();
-
-    if trustlet.infer_context.1 * 4096 < size{
-        params.rcx = 0;
-        return Err(MonitorError::invalid_params());
-    }
 
     let dst = 0x30000000000u64 as *mut u8;
     let src = 0x38000000000u64 as *const u8;
 
     unsafe { core::ptr::copy(src, dst, size.try_into().unwrap()) };
+
+    /* Balanced teardown, as in prompt_get. */
+    pgd[idx2] = 0;
+    trustlet.infer_context.unmount();
 
     params.rcx = size;
 

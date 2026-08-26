@@ -33,6 +33,7 @@ pub static mut CONTROL: [PhysAddr; 64] = [PhysAddr::null(); 64];
 /// The core currently donated to the monitor (its exclusive command
 /// loop is live), if any. Used to route trustlet GPU channels to the
 /// polling core.
+#[allow(dead_code)] // unused since gpu_channel switched to replacement_donated_core
 pub fn donated_core() -> Option<usize> {
     for i in 0..64 {
         if is_donated(i) {

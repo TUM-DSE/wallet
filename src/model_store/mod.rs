@@ -49,6 +49,13 @@ fn load_init(params: &mut RequestParams) -> AllocationRange {
     capture(202);
     page_table[1] = range.0;
 
+    /* Slot 6 was needed only for guest_write_access()'s VA pass above;
+       the guest writes the model bytes through its OWN PGD slot 1, and
+       load_fin re-mounts via e.data.mount(). Leaving it mounted was
+       the guaranteed leak feeding the stale-slot adoption corruption
+       (PLAN.md F2/F3). */
+    range.unmount();
+
     return range;
 }
 

@@ -173,7 +173,14 @@ pub fn infer_call(params: &mut RequestParams) -> Result<(), MonitorError> {
     let trustlet = PROCESS_STORE.get(ProcessID(tid.try_into().unwrap()));
 
     let (_map, page_table) = paddr_as_slice!(guest_pgt.into());
+    /* guest_write_access() does its RMP pass through VAs at
+       0x30000000000 and previously ran WITHOUT a mount - it only
+       worked when an earlier call's leaked slot 6 happened to hold
+       this trustlet's infer_context (PLAN.md F2/F3). Mount/unmount
+       explicitly. */
+    trustlet.infer_context.mount();
     trustlet.infer_context.guest_write_access();
+    trustlet.infer_context.unmount();
     page_table[1] = trustlet.infer_context.0;
 
     Ok(())
@@ -185,7 +192,10 @@ pub fn infer_call_ret(params: &mut RequestParams) -> Result<(), MonitorError> {
     let trustlet = PROCESS_STORE.get(ProcessID(tid.try_into().unwrap()));
 
     let (_map, page_table) = paddr_as_slice!(guest_pgt.into());
+    /* Same missing-mount fix as infer_call. */
+    trustlet.infer_context.mount();
     trustlet.infer_context.guest_remove_write_access();
+    trustlet.infer_context.unmount();
     page_table[1] = 0;
 
     Ok(())

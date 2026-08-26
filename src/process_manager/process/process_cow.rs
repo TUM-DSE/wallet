@@ -6,7 +6,6 @@ pub const PAGE_SIZE: usize = 4096;
 //use crate::memory::SVSM_PERCPU_VMSA_BASE;
 use crate::process_manager::process_memory;
 use crate::process_manager::PROCESS_STORE_SIZE;
-use crate::process_manager::process_memory::allocate_page;
 use crate::process_manager::process_paging::ProcessPageTableRef;
 use crate::process_runtime::runtime::early_invoke;
 use crate::process_runtime::process::mmap::MmapManager;
