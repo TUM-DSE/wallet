@@ -33,14 +33,17 @@ impl ProcessRuntimePrint for PALContext {
             self.string_pos += 1;
         } else {
             log::info!("Trustlet Debug Message to long");
-            let debug_string = str::from_utf8(&self.string_buf).unwrap();
-            log::info!(" [Trustlet](partial) {}", debug_string);
+            /* The bytes come from the trustlet: from_utf8().unwrap()
+               panicked the monitor (and with it the whole VM) on any
+               non-UTF-8 byte a trustlet chose to print. */
+            log::info!(" [Trustlet](partial) {}",
+                       str::from_utf8(&self.string_buf).unwrap_or("<non-utf8>"));
             self.string_pos = 0;
             self.string_buf = [0;256];
         }
         if c == 0 {
-            let debug_string = str::from_utf8(&self.string_buf).unwrap();
-            log::info!(" [Trustlet] {}", debug_string);
+            log::info!(" [Trustlet] {}",
+                       str::from_utf8(&self.string_buf).unwrap_or("<non-utf8>"));
             self.string_pos = 0;
             self.string_buf = [0;256];
         }

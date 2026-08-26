@@ -141,8 +141,13 @@ impl ProcessRuntime for PALContext  {
                 let c = vmsa.rbx;
                 log::info!("{}", c);
 
-                let     c_str = core::char::from_digit(c as u32, 10).unwrap();
-                log::info!("{}",c_str);
+                /* from_digit(.., 10) is None for anything above 9, and
+                   the unwrap panicked the VM on a trustlet-chosen
+                   value. */
+                match core::char::from_digit(c as u32, 10) {
+                    Some(c_str) => log::info!("{}", c_str),
+                    None => log::info!("<not a digit>"),
+                }
                 return true
             }
             ProcessCallType::TbrDebugPrint => {

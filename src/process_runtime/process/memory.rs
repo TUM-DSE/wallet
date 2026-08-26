@@ -138,15 +138,26 @@ impl ProcessRuntimeMemory for PALContext {
         let mut page_table_ref = ProcessPageTableRef::default();
         page_table_ref.set_external_table(page_table);
 
-        assert!(addr % 4096 == 0, "Address is not page aligned");
-        assert!(size % 4096 == 0, "Size is not multiple of page size");
-        assert!(offset % 4096 == 0, "Offset is not page aligned");
-
-        if size % 4096 != 0 {
+        /* addr/size/offset are trustlet registers: the asserts were a
+           monitor panic, i.e. the whole VM, and they fired BEFORE the
+           graceful size check below could ever run (that check was
+           dead code). Refuse in rcx and resume the trustlet, the
+           convention the other VMPL1 handlers use. */
+        if addr % 4096 != 0 || size % 4096 != 0 || offset % 4096 != 0 {
+            log::warn!("map: unaligned request addr {:#x} size {:#x} offset {:#x}",
+                       addr, size, offset);
             self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
             return RETURN_TO_PROCESS;
         }
         let num_pages = size / 4096;
+        /* size is trustlet-chosen and the writecopy branch allocates a
+           page per iteration. */
+        let available = crate::process_manager::process_memory::pages_available();
+        if num_pages + 16 >= available {
+            log::warn!("map: {} pages requested, {} available", num_pages, available);
+            self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
+            return RETURN_TO_PROCESS;
+        }
 
         let writable = (flags & GraminePalProtFlags::WRITE.bits()) != 0;
         let executable = (flags & GraminePalProtFlags::EXEC.bits()) != 0;

@@ -322,7 +322,19 @@ pub fn preallocate_memory() {
 }
 
 pub fn allocate_page() -> PhysAddr {
-    PROCESS_MEM_CONFIG.lock().get_free_page()
+    let p = PROCESS_MEM_CONFIG.lock().get_free_page();
+    /* Exhaustion is still fatal, but now it says so: the old failure
+       was a pvalidate error one page past the region, and the ~37
+       callers (map_4k_page, handle_cow, AllocationRange::*, channel
+       inflate, ...) all return () and cannot propagate a null.
+       Guest- and trustlet-driven entry points pre-flight against
+       pages_available() so this is unreachable from untrusted input;
+       propagating failure through those callers is the proper fix and
+       is logged in PLAN.md. */
+    if p.is_null() {
+        panic!("monitor memory exhausted (no free page)");
+    }
+    p
 }
 
 /// Pages the monitor can still hand out. Guest-facing handlers use

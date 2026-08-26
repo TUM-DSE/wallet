@@ -52,7 +52,19 @@ pub struct InferRequestData {
 
 impl ProcessRuntimeInference for PALContext {
     fn pal_inference(&mut self) -> ReturnTarget {
-        let request_type: PalInferenceRequestType = self.vmsa.rcx.try_into().unwrap();
+        /* rcx is trustlet-chosen and only 0 and 2 are variants (1 is
+           deliberately absent) - the unwrap panicked the VM. Report
+           the refusal in rcx, the convention the other VMPL1 handlers
+           use, and resume the trustlet. */
+        let request_type: PalInferenceRequestType = match self.vmsa.rcx.try_into() {
+            Ok(t) => t,
+            Err(_) => {
+                let rcx = self.vmsa.rcx;   // packed field: copy before &
+                log::warn!("inference: invalid request type {}", rcx);
+                self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
+                return RETURN_TO_PROCESS;
+            }
+        };
 
         if request_type == PalInferenceRequestType::REGISTER {
 

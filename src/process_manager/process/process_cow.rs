@@ -153,6 +153,17 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
 
     log::info!("allocated memory before creation: {}", process_memory::allocated_amount());
 
+    /* size is guest-chosen and drives copy_data_from_guest's per-page
+       allocation; without this the allocator ran off the end of its
+       region and died. Leave slack for the page-table pages the copy
+       itself needs. */
+    let needed = size.div_ceil(PAGE_SIZE as u64) + 16;
+    let available = process_memory::pages_available();
+    if needed >= available {
+        log::warn!("create: {} pages requested, {} available", needed, available);
+        return reject(params, crate::process_manager::STATUS_NO_RESOURCES);
+    }
+
     match t {
         TrustedProcessType::Undefined => panic!("Invalid Creation Request"),
         TrustedProcessType::Zygote => {
