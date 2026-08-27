@@ -53,7 +53,11 @@ pub fn wallet_memory_init() {
 }
 
 pub fn wallet_process_protocol_request(request: u32, params: &mut RequestParams) -> i64 {
-    log::debug!("{:x?}",params);
+    /* GpuApi is the per-ioctl transport probe (test/transport.c): a
+       serial log per call turns a ~us measurement into ~10 ms. */
+    if request != crate::monitor_call_type::MonitorCallType::GpuApi as u32 {
+        log::debug!("{:x?}",params);
+    }
     match process_manager::call_handler::monitor_call_handler(request, params) {
         Err(e) => {log::error!("{}", e); return -1;},
         _ => 0

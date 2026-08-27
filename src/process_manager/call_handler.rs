@@ -95,7 +95,10 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
         return crate::process_manager::reject(params, crate::process_manager::STATUS_UNSUPPORTED);
     }
     let call: MonitorCallType = unsafe {core::mem::transmute(request)};
-    log::debug!("Montior calle: {:?}", call);
+    /* Same guard as lib.rs: keep serial logging out of the GpuApi
+       hot loop so the per-ioctl benchmark measures transport. */
+    let hot = call == MonitorCallType::GpuApi;
+    if !hot { log::debug!("Montior calle: {:?}", call); }
     let res = match call {
         MonitorCallType::InitMonitor =>
             monitor_init(params),
@@ -204,8 +207,10 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
            wedged the guest vCPU via the Err -> INCOMPLETE retry. */
     };
 
-    log::debug!("Monitor call finished: {:?}",res);
-    log::debug!("{:#x?}",params);
+    if !hot {
+        log::debug!("Monitor call finished: {:?}",res);
+        log::debug!("{:#x?}",params);
+    }
     breakdown_outb(255);
     return res;
 }
