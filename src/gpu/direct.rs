@@ -221,6 +221,16 @@ static mut HEAP_MAPPED: [u64; 64] = [0; 64];
 /// bookkeeping.
 static mut ENGINE_IS_TRUSTLET: [bool; 64] = [false; 64];
 
+/* Set by free_engine_slot when a LIVE session is torn down (serve
+   trustlet deleted, client SIGKILLed): the session's stop (500) was
+   never sent, so the service still holds its modules. The DONATED
+   poller forwards the stop from its own loop - it may take the service
+   tens of seconds to reset (cuModuleUnload x123 after a llama
+   session), and the donated core is the only place that can block that
+   long without the VMPL0-residency IPI hazard. Handled BEFORE any
+   relaying, so the next session cannot race the reset. */
+static mut PENDING_SERVICE_STOP: [bool; 64] = [false; 64];
+
 fn heap_for(core: usize) -> (PhysAddr, usize) {
     unsafe {
         if core < 64 && HEAP_DIRS[core] != PhysAddr::null() && HEAP_NPAGES[core] != 0 {
@@ -482,22 +492,13 @@ pub fn free_engine_slot(core: usize) {
        service kept the session's modules and the NEXT session died on
        "module table full". A cleanly stopped session reached here with
        the registration already nulled by poll_engine's 500 path, so
-       had_session distinguishes the two - no double stop. Ordering:
-       registration nulled above FIRST, so the poller is idle on this
-       core before the service page is touched from this context. */
+       had_session distinguishes the two - no double stop. Forwarding
+       happens on the DONATED poller (see PENDING_SERVICE_STOP), never
+       here: this runs in a guest ioctl's vCPU, and waiting out a
+       multi-second service reset at VMPL0 is the parked-CPU IPI
+       hazard. */
     if had_session {
-        let sp = service_page_for(core);
-        if sp != PhysAddr::null() {
-            if let Ok(mapping) = PerCPUPageMappingGuard::create_4k(sp) {
-                let service: &mut CommunicationPage =
-                    unsafe { &mut *mapping.virt_addr().as_mut_ptr::<CommunicationPage>() };
-                if forward_call(service, 500) {
-                    log::info!("engine slot {}: stop forwarded to service", core);
-                } else {
-                    log::warn!("engine slot {}: service ignored the stop", core);
-                }
-            }
-        }
+        unsafe { PENDING_SERVICE_STOP[core] = true; }
     }
     log::warn!("engine slot {} freed (owner died)", core);
 }
@@ -586,6 +587,37 @@ pub fn poll_engine(core: usize,
             }
         }
 
+        /* A dead session's deferred stop is forwarded before ANY other
+           relaying (and only in donated mode - ctr - where blocking is
+           this core's job): the service may spend tens of seconds in
+           its reset, and the next session's calls must queue behind
+           it, not race it into forward_call's timeout. */
+        if ctr.is_some() && unsafe { PENDING_SERVICE_STOP[core] } {
+            let sp = service_page_for(core);
+            if sp != PhysAddr::null() {
+                log::info!("deferred stop -> service page {:#x?} (core {})",
+                           sp, core);
+                if let Ok(m) = PerCPUPageMappingGuard::create_4k(sp) {
+                    let svc: &mut CommunicationPage =
+                        unsafe { &mut *m.virt_addr().as_mut_ptr::<CommunicationPage>() };
+                    let mut acked = false;
+                    for _ in 0..10 {
+                        if forward_call(svc, 500) {
+                            acked = true;
+                            break;
+                        }
+                    }
+                    if acked {
+                        log::info!("deferred stop acked by service (core {})", core);
+                    } else {
+                        log::warn!("deferred stop: service never acked (core {})", core);
+                    }
+                }
+            }
+            unsafe { PENDING_SERVICE_STOP[core] = false; }
+            continue;
+        }
+
         let current = unsafe { ENGINE_PAGES[core] };
         if current == PhysAddr::null() {
             return LOOP_CLEAR;
@@ -620,6 +652,8 @@ pub fn poll_engine(core: usize,
             service_mapping = if sp == PhysAddr::null() {
                 None
             } else {
+                log::info!("poll_engine[{}]: relaying to service page {:#x?}",
+                           core, sp);
                 Some(PerCPUPageMappingGuard::create_4k(sp).unwrap())
             };
             service_phys = sp;
