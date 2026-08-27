@@ -252,11 +252,16 @@ fn monitor_report(params: &mut RequestParams) -> Result<(), MonitorError> {
         let mut rep: [u8; REPORT_RESPONSE_SIZE] = [0; REPORT_RESPONSE_SIZE];
 
         /* Get a regular report of type struct SnpReportResponse */
+        /* A PSP that errors or answers with something malformed is a
+           failed request, not a reason to kill the VM - and the guest
+           drives when this runs, so it must not be able to turn a
+           throttled/busy PSP into everyone's VM ending. The dispatcher
+           turns these into STATUS_REJECTED. */
         let _rep_struct_size = match crate::interop::report::get_regular_report(&mut rep) {//get_regular_report(&mut rep) {
             Ok(e) => e,
             Err(e) => {
-                log::info!("Error from get report: {:?}", e);
-                panic!();
+                log::warn!("Error from get report: {:?}", e);
+                return Err(MonitorError::report_failed());
             }
         };
 
@@ -269,8 +274,8 @@ fn monitor_report(params: &mut RequestParams) -> Result<(), MonitorError> {
         match snp_response.validate() {
           Ok(e) => e,
           Err(e) => {
-              log::info!("Invalid SNP report: {:?}", e);
-              panic!();
+              log::warn!("Invalid SNP report: {:?}", e);
+              return Err(MonitorError::report_invalid());
           }
         };
 
@@ -625,11 +630,13 @@ fn monitor_report_cold(params: &mut RequestParams) -> Result<(), MonitorError> {
     let mut rep: [u8; REPORT_RESPONSE_SIZE] = [0; REPORT_RESPONSE_SIZE];
 
     /* Get a regular report of type struct SnpReportResponse */
+    /* Same as monitor_report: a PSP error or a malformed response is a
+       failed request, not VM death. */
     let _rep_struct_size = match crate::interop::report::get_regular_report(&mut rep) {
         Ok(e) => e,
         Err(e) => {
-            log::info!("Error from get report: {:?}", e);
-            panic!();
+            log::warn!("Error from get report: {:?}", e);
+            return Err(MonitorError::report_failed());
         }
     };
 
@@ -642,8 +649,8 @@ fn monitor_report_cold(params: &mut RequestParams) -> Result<(), MonitorError> {
     match snp_response.validate() {
       Ok(e) => e,
       Err(e) => {
-          log::info!("Invalid SNP report: {:?}", e);
-          panic!();
+          log::warn!("Invalid SNP report: {:?}", e);
+          return Err(MonitorError::report_invalid());
       }
     };
 

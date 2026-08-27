@@ -312,8 +312,10 @@ impl ProcessPageTableRef {
         self.add_region_vaddr(VirtAddr::from(TP_FUNCTION_START_VADDR), data);
     }
 
-    pub fn add_pages(&self, start: VirtAddr, size: u64, flags: ProcessPageFlags) {
-        self.map_4k_pages(start, flags, size);
+    /// False when the range was not free - see map_4k_pages.
+    #[must_use]
+    pub fn add_pages(&self, start: VirtAddr, size: u64, flags: ProcessPageFlags) -> bool {
+        self.map_4k_pages(start, flags, size)
     }
 
     #[allow(unused_mut)]
@@ -575,6 +577,26 @@ impl ProcessPageTableRef {
         }
     }
 
+    /// True when `data`/`size` parse as an ELF64 the builder accepts.
+    ///
+    /// Callers check this BEFORE `build_from_file`, so a guest that
+    /// sends a non-ELF PAL is refused while nothing has been allocated
+    /// yet: build_from_file's own failure path used to be `panic!()`,
+    /// i.e. any guest could kill the VM with one bad byte, and by then
+    /// init_vmpl1 had already built a page table that abort would
+    /// never unwind.
+    pub fn elf_ok(data: VirtAddr, size: u64) -> bool {
+        let elf_addr: *mut u8 = data.as_mut_ptr::<u8>();
+        let elf_raw = unsafe { slice::from_raw_parts(elf_addr, size as usize) };
+        match elf::Elf64File::read(elf_raw) {
+            Ok(_) => true,
+            Err(e) => {
+                log::warn!("PAL is not a usable ELF: {}", e);
+                false
+            }
+        }
+    }
+
     pub fn build_from_file(&mut self, data: VirtAddr, size: u64) -> VirtAddr{
 
         self.init_vmpl1();
@@ -582,8 +604,11 @@ impl ProcessPageTableRef {
         let elf_raw = unsafe { slice::from_raw_parts(elf_addr, size as usize) };
         match elf::Elf64File::read(elf_raw) {
             Ok(e) => self.build_from_elf(elf_addr, elf_raw, e),
-            Err(e) => {log::info!("error reading ELF: {}", e);
-                       panic!()},
+            /* Defence in depth behind elf_ok(): a null entry point
+               faults the trustlet at VMPL1 (handled, marks it dead)
+               instead of taking the whole VM down. */
+            Err(e) => {log::warn!("error reading ELF: {} - entry point 0", e);
+                       VirtAddr::from(0u64)},
         }
     }
 
@@ -594,6 +619,18 @@ impl ProcessPageTableRef {
         let copy_page_count = size / PAGE_SIZE_4K;
         for i in 0..copy_page_count {
             let origin_phys = self.get_page(origin + 4096usize * (i as usize));
+            /* An unmapped guest source page walks out as phys 0, and
+               create_4k(0) SUCCEEDS - so without this the monitor
+               copied GUEST PAGE 0 in as zygote/trustlet payload and
+               measured it as if the guest had sent it. Stop instead
+               and leave the rest of the target as allocated (zeroed);
+               copy_address_range_to_guest has had this guard on the
+               destination side all along. */
+            if origin_phys == PhysAddr::null() {
+                log::warn!("copy_address_range: source page {} of {} unmapped at {:#x} - truncating",
+                           i, copy_page_count, u64::from(origin));
+                break;
+            }
             let (_mapping,origin_slice) = paddr_as_slice!(origin_phys);
             let target_vaddr = target + 4096usize * (i as usize);
             let target_slice = vaddr_as_slice!(target_vaddr);
@@ -852,7 +889,17 @@ impl ProcessPageTableRef {
         page_table_ref.copy_address_range_to_guest(VirtAddr::from(dst_addr), size, source);
     }
 
-    pub fn map_4k_pages(&self, target: VirtAddr, flags: ProcessPageFlags, count: u64) {
+    /// Map `count` fresh 4 KiB pages at `target`.
+    ///
+    /// Returns false if the range is not free - the target VA comes
+    /// from the TRUSTLET (pal_svsm_virt_alloc's rbx), so a trustlet
+    /// that allocates the same address twice used to `panic!()` here,
+    /// i.e. one buggy trustlet ended the VM for every tenant. Pages
+    /// before the conflict stay mapped: the caller reports the failure
+    /// and the trustlet's allocator is expected to give up on the
+    /// range, not retry into it.
+    #[must_use]
+    pub fn map_4k_pages(&self, target: VirtAddr, flags: ProcessPageFlags, count: u64) -> bool {
         let (_pgd_mapping, pgd_table) = paddr_as_table!(self.process_page_table);
         let mut pgd_idx;
         let mut pud_idx;
@@ -890,12 +937,14 @@ impl ProcessPageTableRef {
             while c < count && pte_idx < 512 {
                 let page = pte_table[pte_idx];
                 if page.flags().contains(ProcessPageFlags::PRESENT) {
-                    log::error!("Trying to reallocate already existing address: {:#x?}", page.0);
-                    panic!();
+                    log::warn!("map_4k_pages: {:#x} already mapped ({:#x?}) - refusing",
+                               u64::from(current_addr), page.0);
+                    return false;
                 }
                 if page.flags().contains(ProcessPageFlags::COPY_ON_WRITE) {
-                    log::error!("Page is Copy on write!!!!!!");
-                    panic!();
+                    log::warn!("map_4k_pages: {:#x} is copy-on-write - refusing",
+                               u64::from(current_addr));
+                    return false;
                 }
                 let new_page = allocate_page();
                 let (mapping, s) = paddr_as_slice!(new_page);
@@ -907,6 +956,7 @@ impl ProcessPageTableRef {
                 current_addr = current_addr + PAGE_SIZE;
             }
         }
+        true
     }
 
     pub fn map_4k_page(&self, target: VirtAddr, addr: PhysAddr, flags: ProcessPageFlags) {

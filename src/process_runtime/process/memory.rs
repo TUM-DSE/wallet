@@ -76,7 +76,14 @@ impl ProcessRuntimeMemory for PALContext {
             page_flags = page_flags & !ProcessPageFlags::NO_EXECUTE;
         }
 
-        page_table_ref.add_pages(VirtAddr::from(addr), size / 4096, page_flags);
+        /* addr is the trustlet's: asking for a range that is already
+           mapped used to panic the monitor (VM death for every
+           tenant). Same -1 failure the checks above return. */
+        if !page_table_ref.add_pages(VirtAddr::from(addr), size / 4096, page_flags) {
+            log::warn!("virt_alloc: {:#x} ({} pages) not free", addr, size / 4096);
+            self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
+            return RETURN_TO_PROCESS;
+        }
 
         self.vmsa.rcx = u64::from_ne_bytes((0i64).to_ne_bytes());
 

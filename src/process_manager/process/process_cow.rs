@@ -53,11 +53,42 @@ impl TrustedProcess {
         range.unmount();
         range.delete();
 
+        /* Second-order guest input: create_trusted_process pre-flights
+           only the STRUCT's own size, but these three sizes come out of
+           the guest-written struct above and each drives a per-page
+           copy_data_from_guest allocation. Unchecked they walk the
+           allocator to exhaustion, where allocate_page panics - i.e. a
+           guest-chosen number kills the VM. Checked together (one
+           creation does all three) with slack for the page-table pages
+           the copies need. Undefined = rejected, the same signal the
+           trustlet path already returns to create_trusted_process. */
+        let needed = ProcessPageTableRef::page_round_up(pal_size)
+            .saturating_add(ProcessPageTableRef::page_round_up(manifest_size))
+            .saturating_add(ProcessPageTableRef::page_round_up(libos_size))
+            / PAGE_SIZE as u64;
+        let available = process_memory::pages_available();
+        if needed.saturating_add(16) >= available {
+            log::warn!("create zygote: pal {} + manifest {} + libos {} needs {} pages, {} available",
+                       pal_size, manifest_size, libos_size, needed, available);
+            return TrustedProcess::empty();
+        }
+
         let mut base = ProcessBaseContext::default();
         let mut measurements = ProcessMeasurements::default();
 
         let (pal_data, pal_range) = ProcessPageTableRef::copy_data_from_guest(pal, pal_size, pgt);
         log::debug!("pal_data {:?} pal_range {:?}", pal_data, pal_range);
+        /* The PAL is guest bytes: build_from_file panicked on anything
+           that is not an ELF (and on a short/unmapped copy, which now
+           arrives as zeroes). Reject here - before init_with_data
+           builds a page table - so the only thing to release is this
+           copy. */
+        if !ProcessPageTableRef::elf_ok(pal_data, pal_size) {
+            log::warn!("create zygote: rejected, PAL is not an ELF");
+            pal_range.unmount();
+            pal_range.delete();
+            return TrustedProcess::empty();
+        }
         base.init_with_data(pal_data, pal_size, pal_range);
         breakdown_outb(198);
         measurements.init_measurement = measure(pal_data.into(), pal_size);
@@ -174,6 +205,18 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
             // e.g. Copy the Zygote into memory
             // and parse it to create a page table
             let z: TrustedProcess = TrustedProcess::zygote(process_addr, size, guest_pgt);
+            /* Same convention as the trustlet branch below: Undefined
+               means zygote() refused (its guest-supplied pal/manifest/
+               libos sizes did not fit) - it allocated nothing, so there
+               is nothing to unwind, but it must NOT be inserted: an
+               Undefined entry reads as a free slot and the guest would
+               get an id for a process that is not there. */
+            if z.process_type == TrustedProcessType::Undefined {
+                /* Sizes that do not fit, or a PAL that is not an ELF -
+                   zygote() logged which. */
+                log::warn!("create zygote: rejected (see warning above)");
+                return reject(params, crate::process_manager::STATUS_REJECTED);
+            }
             //context.early_init(base, measurements);
 
             // Insert it into the process store
