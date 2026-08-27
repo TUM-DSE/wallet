@@ -465,6 +465,7 @@ pub fn free_engine_slot(core: usize) {
     if core >= 64 {
         return;
     }
+    let had_session = unsafe { ENGINE_PAGES[core] != PhysAddr::null() };
     unsafe {
         /* Trustlet sessions use a monitor-allocated comm page - stash
            it for deferred reclamation (see RETIRED_ENGINE_PAGE). A
@@ -475,6 +476,28 @@ pub fn free_engine_slot(core: usize) {
         }
         ENGINE_PAGES[core] = PhysAddr::null();
         HEAP_MAPPED[core] = 0;
+    }
+    /* Wire the stop the session never sent: a serve-mode trustlet (and
+       a SIGKILLed client) dies without the 500, so a persistent
+       service kept the session's modules and the NEXT session died on
+       "module table full". A cleanly stopped session reached here with
+       the registration already nulled by poll_engine's 500 path, so
+       had_session distinguishes the two - no double stop. Ordering:
+       registration nulled above FIRST, so the poller is idle on this
+       core before the service page is touched from this context. */
+    if had_session {
+        let sp = service_page_for(core);
+        if sp != PhysAddr::null() {
+            if let Ok(mapping) = PerCPUPageMappingGuard::create_4k(sp) {
+                let service: &mut CommunicationPage =
+                    unsafe { &mut *mapping.virt_addr().as_mut_ptr::<CommunicationPage>() };
+                if forward_call(service, 500) {
+                    log::info!("engine slot {}: stop forwarded to service", core);
+                } else {
+                    log::warn!("engine slot {}: service ignored the stop", core);
+                }
+            }
+        }
     }
     log::warn!("engine slot {} freed (owner died)", core);
 }
