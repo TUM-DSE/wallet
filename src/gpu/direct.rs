@@ -560,7 +560,9 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
 
         if call_id == 500 {
             if let Some(service) = service {
-                forward_call(service, call_id);
+                // Session is ending either way; a timeout here is not
+                // worth special handling beyond the log.
+                let _ = forward_call(service, call_id);
             }
             args.lock.store(0, Ordering::Release);
             // Session over: drop the registration so the poller goes
@@ -575,6 +577,13 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
             let err = bulk_memcpy(core, args, service);
             args.data[0..4].copy_from_slice(&err.to_le_bytes());
             args.lock.store(0, Ordering::Release);
+            if err == RELAY_TIMEOUT_ERR {
+                // Same treatment as the single-call path: without this
+                // the next ordinary call pays another full timeout.
+                drop_service(core);
+                service_phys = PhysAddr::null();
+                service_mapping = None;
+            }
             continue;
         }
 
@@ -582,7 +591,18 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
             match service {
                 Some(service) => {
                     service.data[..req_len].copy_from_slice(&args.data[..req_len]);
-                    forward_call(service, call_id);
+                    if !forward_call(service, call_id) {
+                        /* Fail this call back to the client and drop
+                           the dead service, rather than spinning here
+                           forever with the CPU (and, on the legacy
+                           path, the guest) held hostage. */
+                        args.data[0..4].copy_from_slice(&RELAY_TIMEOUT_ERR.to_le_bytes());
+                        args.lock.store(0, Ordering::Release);
+                        drop_service(core);
+                        service_phys = PhysAddr::null();
+                        service_mapping = None;
+                        continue;
+                    }
                     args.data[..resp_len].copy_from_slice(&service.data[..resp_len]);
                     /* The service just registered more heap chunk(s):
                        map the delta into this core's trustlet before
@@ -628,13 +648,19 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
 /// Legacy parked-thread path (GpuRun): the client thread pinned to the
 /// polling core enters here and the call only returns on the client's
 /// stop message. Kept for A/B comparison with donated-core polling.
-pub fn run(_params: &mut RequestParams) -> Result<(), MonitorError> {
+pub fn run(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     let id = get_apic_id() as usize;
 
     let engine_page = unsafe {ENGINE_PAGES[id]};
 
     log::warn!("Monitor polling on {:#x?} on thread {}", engine_page, id);
+    /* Defined status, like register_service: this handler used to leave
+       rcx untouched, and the guest wrapper never initialised it, so
+       gpu_run returned uninitialised stack to userspace. 0 = the
+       session is over (stop id 500, or nothing registered on this
+       core) - the parked thread should exit, not re-enter. */
+    params.rcx = 0;
     if engine_page == PhysAddr::null() {
         log::warn!("No engine found");
         return Ok(())
@@ -925,7 +951,10 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
             filled += take;
         }
 
-        forward_call(service, MEMCPY_ID);
+        if !forward_call(service, MEMCPY_ID) {
+            err = RELAY_TIMEOUT_ERR;
+            break;
+        }
 
         let e = i32::from_le_bytes(service.data[0..4].try_into().unwrap());
         if e != 0 {
@@ -962,15 +991,55 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
     err
 }
 
-fn forward_call(service: &mut CommunicationPage, call_id: u32) {
+/// Error handed to the client when the service does not answer within
+/// FORWARD_TIMEOUT_SECS. Distinct from any CUDA error so it is
+/// recognisable in a client log.
+pub const RELAY_TIMEOUT_ERR: i32 = 802;
+const FORWARD_TIMEOUT_SECS: u64 = 30;
+
+/// Relay one call to the service. Returns false if the service did not
+/// answer in time.
+///
+/// This spin used to be unbounded, so a wedged or killed service
+/// stranded the polling CPU with no recovery but a VM reboot - and on
+/// the legacy path that CPU belongs to the guest, so the whole guest
+/// went with it. A bounded outer poll loop cannot help: the wait
+/// happens INSIDE one iteration.
+#[must_use]
+fn forward_call(service: &mut CommunicationPage, call_id: u32) -> bool {
+    use crate::utils::tsc::{rdtsc, ticks_for_secs};
     service.id.store(call_id, Ordering::Relaxed);
     service.lock.store(1, Ordering::Release);
+    let deadline = rdtsc().wrapping_add(ticks_for_secs(FORWARD_TIMEOUT_SECS));
     let mut spins: u64 = 0;
     while service.lock.load(Ordering::Acquire) != 0 {
         spins = spins.wrapping_add(1);
-        if spins % 4_000_000_000u64 == 0 {
-            log::warn!("forward_call: still waiting on service for id {} ({}B spins)",
-                       call_id, spins / 1_000_000_000);
+        /* Check the clock rarely: rdtsc is cheap but this is the
+           hottest loop in the relay. */
+        if spins % 4096 == 0 && rdtsc() > deadline {
+            log::error!("forward_call: service did not answer id {} within {} s - \
+                         failing the call and dropping the service registration",
+                        call_id, FORWARD_TIMEOUT_SECS);
+            return false;
+        }
+    }
+    true
+}
+
+/// Drop the service registration after a timeout so the poller goes
+/// idle instead of re-timing-out on every subsequent call. A fresh
+/// service process re-registers (register_service) and relaying
+/// resumes.
+fn drop_service(core: usize) {
+    /* Mirror service_for()'s selection: a per-engine registration wins,
+       otherwise the shared fallback was in use. Only clear the one that
+       was actually being relayed to - clearing the fallback because one
+       engine's private service died would cut off every other engine. */
+    unsafe {
+        if core < 64 && SERVICE_PAGES[core] != PhysAddr::null() {
+            SERVICE_PAGES[core] = PhysAddr::null();
+        } else {
+            SERVICE_PAGE = PhysAddr::null();
         }
     }
 }
