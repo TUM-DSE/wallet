@@ -399,6 +399,33 @@ pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
     let comm_page = params.rcx;
     let core = params.r8 as usize;
     let id = if core < 64 { core } else { get_apic_id() as usize };
+
+    /* comm page 0 = UNREGISTER, issued by vmpl.ko when a client that
+       registered an engine closes its device fd - which covers every
+       way a client dies, SIGKILL included, not just a clean stop (500).
+       Without it a dead client's slot stayed registered until some
+       later client happened to overwrite it: the poller kept polling a
+       dead page, and `make donate` afterwards adopted it.
+       rdx carries the client's own comm page so the slot is freed ONLY
+       if it still holds that page - a client that died after the NEXT
+       client registered on this core must not tear down the newcomer's
+       session (the same shape as the stop-path race fixed today). */
+    if comm_page == 0 {
+        params.rcx = 0;
+        if core >= 64 {
+            return crate::process_manager::reject(
+                params, crate::process_manager::STATUS_BAD_ID);
+        }
+        let owned = PhysAddr::from(page_table);
+        if owned.is_null() || unsafe { ENGINE_PAGES[id] } != owned {
+            log::info!("engine release core {}: slot no longer {:#x?}, ignored",
+                       id, owned);
+            return Ok(());
+        }
+        free_engine_slot(id);
+        return Ok(());
+    }
+
     log::warn!("Registraton: {:#x?} {:#x?} core {}", page_table, comm_page, id);
 
     /* Neither page was validated, and the panic lands LATER on the
