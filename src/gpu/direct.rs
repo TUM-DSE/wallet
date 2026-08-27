@@ -585,10 +585,16 @@ pub fn poll_engine(core: usize,
                 // worth special handling beyond the log.
                 let _ = forward_call(service, call_id);
             }
-            args.lock.store(0, Ordering::Release);
-            // Session over: drop the registration so the poller goes
-            // idle until the next client registers.
+            /* Drop the registration BEFORE releasing the client, not
+               after: the store below lets the client return from its
+               stop and exit, and the NEXT client can register on this
+               core immediately - nulling afterwards wiped THAT
+               registration, leaving the poller idle forever while the
+               new client spun on a page nobody polled. Reproduced by
+               running test/transport twice back to back: the second
+               run reported "no poller answered the first probe". */
             unsafe { ENGINE_PAGES[core] = PhysAddr::null(); }
+            args.lock.store(0, Ordering::Release);
             return LOOP_CLEAR;
         }
 
