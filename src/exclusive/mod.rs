@@ -100,6 +100,10 @@ pub static LOOP_CLEAR: u64 = 0;
 pub static LOOP_EXIT: u64 = 1;
 pub static LOOP_SLEEP: u64 = 2;
 pub static LOOP_WAKEUP: u64 = 3;
+/// Not a command: poll_engine's "yield budget expired" return, only
+/// possible on the bounded parked path (deadline given). Never written
+/// to a control page and never reaches handle_command.
+pub static LOOP_YIELD: u64 = 4;
 
  use crate::address::PhysAddr;
 extern "Rust" {

@@ -492,12 +492,23 @@ pub fn register_engine_page(core: usize, page: PhysAddr, page_table: PhysAddr) {
 /// disappears — return value LOOP_CLEAR — or, when `ctr` is given
 /// (donated-core mode), when a LOOP_* command arrives on the control
 /// page; the consumed command is returned for the caller to handle.
+/// With a `deadline` (absolute TSC; bounded parked mode only), returns
+/// LOOP_YIELD once it passes — checked only at the top of the loop, so
+/// never mid-relay; a call that lands right at expiry just waits one
+/// guest round trip for re-entry.
 ///
 /// The registration is re-read every iteration: a new client's
 /// register_engine replaces a dead client's page, so a crashed client
 /// cannot wedge the poller — the next registration just remaps. The
 /// service mapping likewise follows SERVICE_PAGE re-registrations.
-pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -> u64 {
+///
+/// Locals (mappings, idle_beats, last_id) are caches over per-core
+/// statics and rebuild cheaply on every entry; note the 4e9-beat
+/// "alive, waiting" heartbeat therefore never fires in a bounded
+/// session (~1 ms slices) — a diagnostic loss only.
+pub fn poll_engine(core: usize,
+                   ctr: Option<&crate::exclusive::ControlStruct>,
+                   deadline: Option<u64>) -> u64 {
     use crate::exclusive::LOOP_CLEAR;
 
     let mut engine_phys = PhysAddr::null();
@@ -512,6 +523,16 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
             let cmd = ctr.next.swap(LOOP_CLEAR, Ordering::Relaxed);
             if cmd != LOOP_CLEAR {
                 return cmd;
+            }
+        }
+
+        /* Checked every iteration, not on a spin-counter cadence: busy
+           iterations each contain a full 1-30 us relay, so any counted
+           cadence would overshoot the budget under load. One rdtsc
+           (~25 cycles) is noise against either loop body. */
+        if let Some(d) = deadline {
+            if crate::utils::tsc::rdtsc() > d {
+                return crate::exclusive::LOOP_YIELD;
             }
         }
 
@@ -645,28 +666,65 @@ pub fn poll_engine(core: usize, ctr: Option<&crate::exclusive::ControlStruct>) -
     }
 }
 
-/// Legacy parked-thread path (GpuRun): the client thread pinned to the
-/// polling core enters here and the call only returns on the client's
-/// stop message. Kept for A/B comparison with donated-core polling.
+/// GpuRun statuses returned in rcx (mirrored by GPU_RUN_* in libwallet
+/// memory.h): 0 = session over, exit; 1 = yield budget expired, the
+/// guest kernel loop services pending IPIs and re-enters.
+const GPU_RUN_SESSION_OVER: u64 = 0;
+const GPU_RUN_YIELD: u64 = 1;
+/// Garbage-rdx guard (an old vmpl.ko that predates the budget field
+/// sends stack garbage): budgets above 10 s are clamped, not honored.
+const MAX_YIELD_BUDGET_US: u64 = 10_000_000;
+
+/// Parked-thread path (GpuRun): the client thread pinned to the polling
+/// core enters here. With yield budget 0 (rdx) this is the unbounded
+/// "parked" mode, kept for A/B: the call only returns on the client's
+/// stop message. With a budget it is the "bounded" mode: the call also
+/// returns GPU_RUN_YIELD every ~budget us so the vCPU can ack IPIs in
+/// the guest kernel's re-entry loop (vmpl.c) - which is what removes
+/// the parked-online-CPU TLB-shootdown hazard.
 pub fn run(params: &mut RequestParams) -> Result<(), MonitorError> {
+    use crate::utils::tsc::{rdtsc, ticks_for_micros};
 
     let id = get_apic_id() as usize;
 
+    /* Input registers - read before rcx doubles as the status output:
+       rcx = 0 on first entry / 1 on re-entry (set by the kernel loop),
+       rdx = yield budget in us (0 = never yield). */
+    let first_entry = params.rcx == 0;
+    let budget_us = params.rdx.min(MAX_YIELD_BUDGET_US);
+
     let engine_page = unsafe {ENGINE_PAGES[id]};
 
-    log::warn!("Monitor polling on {:#x?} on thread {}", engine_page, id);
+    if first_entry {
+        log::warn!("Monitor polling on {:#x?} on thread {} (yield budget {} us)",
+                   engine_page, id, budget_us);
+    }
     /* Defined status, like register_service: this handler used to leave
        rcx untouched, and the guest wrapper never initialised it, so
-       gpu_run returned uninitialised stack to userspace. 0 = the
-       session is over (stop id 500, or nothing registered on this
-       core) - the parked thread should exit, not re-enter. */
-    params.rcx = 0;
+       gpu_run returned uninitialised stack to userspace. */
+    params.rcx = GPU_RUN_SESSION_OVER;
     if engine_page == PhysAddr::null() {
-        log::warn!("No engine found");
+        /* On a re-entry a vanished registration is the normal end of a
+           session (stop consumed on an earlier entry), not an error. */
+        if first_entry {
+            log::warn!("No engine found");
+        }
         return Ok(())
     }
 
-    poll_engine(id, None);
+    let deadline = if budget_us == 0 {
+        None
+    } else {
+        /* saturating_add, not forward_call's wrapping_add: a saturated
+           huge budget must clamp to "never", not invert into "always
+           expired". */
+        Some(rdtsc().saturating_add(ticks_for_micros(budget_us)))
+    };
+    /* Namespace trap: LOOP_EXIT == 1 == GPU_RUN_YIELD. Map explicitly,
+       never hand poll_engine's raw return to the guest. */
+    if poll_engine(id, None, deadline) == crate::exclusive::LOOP_YIELD {
+        params.rcx = GPU_RUN_YIELD;
+    }
     Ok(())
 
 }

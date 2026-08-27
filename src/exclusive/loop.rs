@@ -97,7 +97,9 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         // any reboot.
         if crate::gpu::direct::engine_registered(id) {
             log::warn!("Donated core {}: polling GPU engine page", id);
-            let cmd = crate::gpu::direct::poll_engine(id, Some(&*ctr));
+            /* No deadline: donated cores are offline in the guest, so
+               there is nothing to yield to (and no IPI hazard). */
+            let cmd = crate::gpu::direct::poll_engine(id, Some(&*ctr), None);
             log::warn!("Donated core {}: GPU session ended ({})", id, cmd);
             if cmd != LOOP_CLEAR && handle_command(ctr, cmd) {
                 break;

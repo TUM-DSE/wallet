@@ -95,9 +95,10 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
         return crate::process_manager::reject(params, crate::process_manager::STATUS_UNSUPPORTED);
     }
     let call: MonitorCallType = unsafe {core::mem::transmute(request)};
-    /* Same guard as lib.rs: keep serial logging out of the GpuApi
-       hot loop so the per-ioctl benchmark measures transport. */
-    let hot = call == MonitorCallType::GpuApi;
+    /* Same guard as lib.rs: keep serial logging out of the hot loops -
+       GpuApi (per-ioctl benchmark) and GpuRun (bounded parked mode
+       re-enters at ~1 kHz; run() logs its own first-entry line). */
+    let hot = call == MonitorCallType::GpuApi || call == MonitorCallType::GpuRun;
     if !hot { log::debug!("Montior calle: {:?}", call); }
     let res = match call {
         MonitorCallType::InitMonitor =>

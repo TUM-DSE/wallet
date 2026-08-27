@@ -30,3 +30,9 @@ pub const TSC_HZ: u64 = 2_400_008_000;
 pub fn ticks_for_secs(secs: u64) -> u64 {
     TSC_HZ.saturating_mul(secs)
 }
+
+/// Ticks in `us` microseconds (bounded-poll yield budgets).
+#[inline(always)]
+pub fn ticks_for_micros(us: u64) -> u64 {
+    (TSC_HZ / 1_000_000).saturating_mul(us)
+}
