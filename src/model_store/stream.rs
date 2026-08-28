@@ -42,9 +42,12 @@ pub const STATE_CLAIMED: u64 = 1 << 57;
 pub const STATE_FAILED: u64 = 1 << 58;
 const WATERMARK_MASK: u64 = (1 << 56) - 1;
 
-/// Initial allocation load_init still pays synchronously: 256 MB (or
-/// the whole model if smaller).
-pub const INITIAL_PAGES: u64 = 65536;
+/// Initial allocation load_init still pays synchronously: 8 MB (or
+/// the whole model if smaller). Was 256 MB - with the fused fill the
+/// worker outruns the writer from the first quantum, and the big
+/// initial chunk's map_region+grant walk was ~1-1.5 s of synchronous
+/// register wall the worker makes unnecessary (F1).
+pub const INITIAL_PAGES: u64 = 2048;
 /// The worker keeps the window this far ahead of the writer.
 const LOOKAHEAD_PAGES: u64 = 16384; // 64 MB
 /// One hash quantum per poll - the worker returns to the exclusive
