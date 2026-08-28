@@ -89,6 +89,19 @@ pub fn replacement_donated_core() -> Option<usize> {
 /// contexts inside one process do not). Donate one core per engine you
 /// want to run concurrently.
 pub fn free_donated_core() -> Option<usize> {
+    /* Prefer a core whose service owes no deferred session reset: the
+       stop of a dead session is delivered at the NEXT session's entry,
+       and the CC driver can stretch that reset to minutes on large
+       sessions - debt the new session should not inherit when a clean
+       engine is available. (This is also what keeps the e2e lukewarm
+       instance off the deleted instance's engine.) */
+    for i in 0..64 {
+        if is_donated(i)
+            && !crate::gpu::direct::engine_registered(i)
+            && !crate::gpu::direct::engine_slot_owes_stop(i) {
+            return Some(i);
+        }
+    }
     for i in 0..64 {
         if is_donated(i) && !crate::gpu::direct::engine_registered(i) {
             return Some(i);

@@ -544,6 +544,15 @@ pub fn service_registered(core: usize) -> bool {
     service_page_for(core) != PhysAddr::null()
 }
 
+/// True when `core`'s service still owes a deferred session reset (a
+/// dead session's stop is pending). The next session on this core
+/// queues behind that reset - which the CC driver can stretch to
+/// minutes on large sessions - so the slot picker prefers cores
+/// without this debt.
+pub fn engine_slot_owes_stop(core: usize) -> bool {
+    core < 64 && unsafe { PENDING_SERVICE_STOP[core] }
+}
+
 /// Register a monitor-provisioned comm page (trustlet GPU channel) in
 /// `core`'s engine slot — same slot and polling as a guest client's
 /// page registered via register_engine.
