@@ -162,7 +162,11 @@ fn ensure_pte_table(pt: &ProcessPageTableRef, va: VirtAddr) -> PhysAddr {
 /// (3) zero ALL pages via the mounted VA - pool pages carry
 ///     freed-trustlet/model data; the zero MUST precede any grant
 ///     issued here (confidentiality),
-/// (4) grant VMPL1|RWX + VMPL2|RWX per page via the mounted VA.
+/// (4) grant VMPL2|RWX per page via the mounted VA (the guest
+///     writes the download here; VMPL1 read access is granted by
+///     trustlet_read_access at model_channel time, so a per-page
+///     VMPL1 grant during the fill is pure waste - table pages DO
+///     keep VMPL1, the VMPL1 walker reads them).
 /// Not-present->present PTEs need no TLB flush (monitor task and
 /// guest walker alike), and pvalidate/rmp_adjust are VA-based, so a
 /// guest racing the watermark can only fault-loop itself - no monitor
@@ -249,7 +253,6 @@ fn fill_unit(pt: &ProcessPageTableRef, start_page: u64, count: usize) -> bool {
 
     for k in 0..count {
         let page_va = VirtAddr::from(va + k as u64 * 4096);
-        let _ = rmp_adjust(page_va, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular);
         let _ = rmp_adjust(page_va, RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
     }
     T_RMP_TSC.fetch_add(rdtsc().wrapping_sub(t5), Ordering::SeqCst);
