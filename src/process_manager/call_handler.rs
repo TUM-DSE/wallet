@@ -98,7 +98,8 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
     /* Same guard as lib.rs: keep serial logging out of the hot loops -
        GpuApi (per-ioctl benchmark) and GpuRun (bounded parked mode
        re-enters at ~1 kHz; run() logs its own first-entry line). */
-    let hot = call == MonitorCallType::GpuApi || call == MonitorCallType::GpuRun;
+    let hot = call == MonitorCallType::GpuApi || call == MonitorCallType::GpuRun
+        || call == MonitorCallType::ModelStreamUpdate;
     if !hot { log::debug!("Montior calle: {:?}", call); }
     let res = match call {
         MonitorCallType::InitMonitor =>
@@ -201,6 +202,8 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
             crate::gpu::direct::register_window(params),
         MonitorCallType::RegisterGpuHeap =>
             crate::gpu::direct::register_heap(params),
+        MonitorCallType::ModelStreamUpdate =>
+            crate::model_store::stream::update(params),
         /* No `_` arm on purpose: the range guard above makes the
            transmute total over the enum, and exhaustiveness is what
            catches a regenerated call_type.h id with no handler at
