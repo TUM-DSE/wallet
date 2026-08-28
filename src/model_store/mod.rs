@@ -2,6 +2,7 @@ pub mod store;
 pub mod model;
 pub mod lora;
 pub mod engine;
+pub mod stream;
 
 pub use store::*;
 
@@ -72,8 +73,14 @@ fn load_init(params: &mut RequestParams) -> AllocationRange {
     let (_map, page_table) = paddr_as_slice!(guest_pgd.into());
 
     log::debug!("Allocating page for guest");
-//    range.allocate_for_guest(((size + PAGE_SIZE_4K) & !PAGE_SIZE_4K) / PAGE_SIZE_4K);
-    range.allocate_for_guest(size.div_ceil(PAGE_SIZE_4K));
+    /* Streaming load: pay only the INITIAL chunk here - the donated
+       worker (or the eager fallback in stream::update) grows the
+       window behind the guest's download. The pages_available check
+       above still covers the FULL size, so exhaustion fails early as
+       before. The guest PGD entry below is the subtree ROOT and never
+       changes as the range grows in place. */
+    let initial = core::cmp::min(pages, stream::INITIAL_PAGES);
+    range.allocate_for_guest(initial);
     log::debug!("Allocation successful");
 
     capture(201);
@@ -81,6 +88,7 @@ fn load_init(params: &mut RequestParams) -> AllocationRange {
     //log::debug!("CYC 3: {}", rdtsc());
     capture(202);
     page_table[1] = range.0;
+    stream::begin(&range, size);
 
     /* Slot 6 was needed only for guest_write_access()'s VA pass above;
        the guest writes the model bytes through its OWN PGD slot 1, and
@@ -110,6 +118,15 @@ fn load_fin(params: &mut RequestParams, store: &Store<StoreEntry>) -> bool{
         params.rcx = 1;
         return false;
     }
+    /* The entry recorded load_init's INITIAL page count; the stream
+       worker (or eager fallback) has grown the range since. fin can
+       only run after a COMPLETE download, and the download cannot
+       outrun the allocation watermark, so the grown count covers the
+       whole model - the revoke walk and the legacy-measure fallback
+       below depend on that invariant. */
+    if stream::is_active() {
+        e.data.1 = core::cmp::max(e.data.1, stream::final_pages());
+    }
     e.data.mount();
 
     capture(204);
@@ -127,8 +144,12 @@ fn load_fin(params: &mut RequestParams, store: &Store<StoreEntry>) -> bool{
 
     log::debug!("[Measure] Region address {:p} and len { }", region, region.len());
 
-    e.measurement =
-        measure(0x30000000000u64, e.real_size);
+    /* Streamed digest when the worker finished; otherwise the legacy
+       synchronous hash (no worker claimed, worker timed out, or a
+       non-hacl build). stream::finish() logs the hash_ms/alloc_ms/
+       wall_ms split either way - the benchmark lanes scrape it. */
+    e.measurement = stream::finish()
+        .unwrap_or_else(|| measure(0x30000000000u64, e.real_size));
 
     capture(206);
     e.data.unmount();

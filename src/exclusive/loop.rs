@@ -114,6 +114,14 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         // engine-registered case runs the same scan inside
         // poll_engine's idle branch). Rate-limited inside.
         crate::process_runtime::log_overbudget_invokes(id, -1);
+        // Streaming model load: one bounded quantum (allocate ahead of
+        // the writer / hash behind it) per iteration, so LOOP_*
+        // commands stay responsive between bites. No-op when no load
+        // is in flight; the core "goes back to sleep" (this idle loop)
+        // when the digest is finalized. Note: a core whose engine
+        // registers mid-load stops polling here - the guest's eager
+        // fallback and fin's legacy measure keep the load correct.
+        crate::model_store::stream::poll_worker(id);
     }
 
     unsafe {
