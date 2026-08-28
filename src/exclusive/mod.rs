@@ -59,19 +59,31 @@ static NEXT_REPLACEMENT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 pub fn replacement_donated_core() -> Option<usize> {
-    let mut n = 0;
+    /* Restrict the rotation to SERVICED cores when any exist: an
+       unserviced alloc-helper core must never receive an engine even
+       when every serviced slot is dirty (replacing a dirty serviced
+       registration beats a working-looking session with no GPU).
+       Legacy single-service setups see no change - the global
+       SERVICE_PAGE fallback makes every core serviced. */
+    let serviced = |i: usize| crate::gpu::direct::service_registered(i);
+    let mut n_serviced = 0;
+    let mut n_all = 0;
     for i in 0..64 {
         if is_donated(i) {
-            n += 1;
+            n_all += 1;
+            if serviced(i) {
+                n_serviced += 1;
+            }
         }
     }
+    let (n, need_service) = if n_serviced > 0 { (n_serviced, true) } else { (n_all, false) };
     if n == 0 {
         return None;
     }
     let k = NEXT_REPLACEMENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % n;
     let mut seen = 0;
     for i in 0..64 {
-        if is_donated(i) {
+        if is_donated(i) && (!need_service || serviced(i)) {
             if seen == k {
                 return Some(i);
             }
@@ -89,16 +101,32 @@ pub fn replacement_donated_core() -> Option<usize> {
 /// contexts inside one process do not). Donate one core per engine you
 /// want to run concurrently.
 pub fn free_donated_core() -> Option<usize> {
-    /* Prefer a core whose service owes no deferred session reset: the
-       stop of a dead session is delivered at the NEXT session's entry,
-       and the CC driver can stretch that reset to minutes on large
-       sessions - debt the new session should not inherit when a clean
-       engine is available. (This is also what keeps the e2e lukewarm
-       instance off the deleted instance's engine.) */
+    /* Three passes. Serviced first: cores donated purely as stream
+       alloc helpers run NO service process - an engine landing there
+       relays every CUDA call into the 802 arm and llama silently
+       falls back to CPU inference (the loud NO SERVICE error in
+       gpu_channel is the tripwire). Within the serviced cores, prefer
+       one whose service owes no deferred session reset: the stop of a
+       dead session is delivered at the NEXT session's entry, and the
+       CC driver can stretch that reset to minutes on large sessions -
+       debt the new session should not inherit when a clean engine is
+       available. (This is also what keeps the e2e lukewarm instance
+       off the deleted instance's engine.) The unserviced last pass
+       keeps no-service smoke setups working; with only the legacy
+       global SERVICE_PAGE fallback, service_registered is true
+       everywhere and the picker behaves exactly as before. */
     for i in 0..64 {
         if is_donated(i)
             && !crate::gpu::direct::engine_registered(i)
-            && !crate::gpu::direct::engine_slot_owes_stop(i) {
+            && !crate::gpu::direct::engine_slot_owes_stop(i)
+            && crate::gpu::direct::service_registered(i) {
+            return Some(i);
+        }
+    }
+    for i in 0..64 {
+        if is_donated(i)
+            && !crate::gpu::direct::engine_registered(i)
+            && crate::gpu::direct::service_registered(i) {
             return Some(i);
         }
     }
