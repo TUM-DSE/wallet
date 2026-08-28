@@ -110,6 +110,6 @@ extern "Rust" {
     fn wallet_get_apic_id() -> u32;
 }
 
-fn get_apic_id() -> u32 {
+pub fn get_apic_id() -> u32 {
     unsafe { wallet_get_apic_id() }
 }

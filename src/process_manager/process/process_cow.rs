@@ -133,6 +133,10 @@ impl TrustedProcess {
             dead: false,
             gpu_core: -1,
             running: false,
+            invoke_owner_apic: u32::MAX,
+            invoke_start_tsc: 0,
+            last_pcall: 0,
+            in_pcall: false,
             infer_context: AllocationRange(0,0),
         }
     }

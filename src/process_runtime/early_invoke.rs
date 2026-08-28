@@ -53,13 +53,26 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         panic!("register_guest_vmsa failed");
     }
 
+    /* Same watchdog budget as invoke_trustlet. No return_values write
+       on expiry: the ReturnValues pointers are null on this path. */
+    let budget = crate::utils::tsc::ticks_for_secs(super::INVOKE_BUDGET_SECS);
+    let start = crate::utils::tsc::rdtsc();
     loop {
         _ = switch_to_vmpl(TRUSTLET_VMPL);
         let rip = rc.vmsa.rip;
         let rax = rc.vmsa.rax;
         let exit = rc.vmsa.guest_exit_code;
         //log::info!("trustlet exit: rip={:x} rax={:x} exit={:x?}", rip, rax, exit);
-        if !rc.handle_process_request(){
+        let cont = rc.handle_process_request();
+        rc.process.in_pcall = false;
+        if !cont {
+            break;
+        }
+        if crate::utils::tsc::rdtsc().wrapping_sub(start) > budget {
+            log::error!("invoke watchdog: zygote early invoke over budget ({} s) \
+                         - rip {:#x} rax {:#x} exit {:x?} - marking dead",
+                        super::INVOKE_BUDGET_SECS, rip, rax, exit);
+            rc.mark_dead();
             break;
         }
     }

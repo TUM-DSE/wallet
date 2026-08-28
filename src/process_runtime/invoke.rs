@@ -162,7 +162,7 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
     let string_pos: usize = 0;
     let sev_features = trustlet.context.sev_features;
 
-    //let apic_id = this_cpu().get_apic_id();
+    let apic_id = crate::exclusive::get_apic_id();
     breakdown_outb(212);
     match invocation_type {
         TrustletInvocationType::NORMAL => {
@@ -294,14 +294,41 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     _ = register_guest_vmsa(vmsa_paddr, TRUSTLET_VMPL, sev_features);
 
+    /* In-loop watchdog: the check can only run when the trustlet makes
+       a monitor call (that is the only way control returns here), so
+       it bounds runaway callers and sessions stuck inside one bounded
+       monitor call. A trustlet spinning silently at VMPL1 never comes
+       back and cannot be aborted from another core (PLAN.md:
+       switch_to_vmpl is blocking, mark_dead is owner-vCPU-only); the
+       donated poller's log_overbudget_invokes covers that family with
+       detection only. One rdtsc per handled request is noise. */
+    let budget = crate::utils::tsc::ticks_for_secs(super::INVOKE_BUDGET_SECS);
+    let start = crate::utils::tsc::rdtsc();
+    rc.process.invoke_owner_apic = apic_id;
+    rc.process.invoke_start_tsc = start;
     rc.process.running = true;
     loop {
         switch_to_vmpl(TRUSTLET_VMPL);
-        if !rc.handle_process_request() {
+        let cont = rc.handle_process_request();
+        rc.process.in_pcall = false;
+        if !cont {
+            break;
+        }
+        if crate::utils::tsc::rdtsc().wrapping_sub(start) > budget {
+            /* VMSA fields are unaligned - copy before formatting. */
+            let rip = rc.vmsa.rip;
+            let rsp = rc.vmsa.rsp;
+            log::error!("invoke watchdog: trustlet {} over budget ({} s) on apic {} \
+                         - rip {:#x} rsp {:#x} - marking dead",
+                        id, super::INVOKE_BUDGET_SECS, apic_id, rip, rsp);
+            rc.mark_dead();
+            rc.return_values.result(super::TrustletReturnType::ERROR as u64);
             break;
         }
     }
     rc.process.running = false;
+    rc.process.invoke_start_tsc = 0;
+    rc.process.invoke_owner_apic = u32::MAX;
     //params.rcx = rc.return_value;
     INVOKES_IN_FLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
     breakdown_outb(214);

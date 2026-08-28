@@ -39,7 +39,8 @@ impl ProcessRuntimeCall for PALContext {
     ///
     /// Return:
     /// * rcx: 0 on success, -1 unknown/!trustlet callee, -2 self-call,
-    ///        -3 call depth exceeded, -4 cycle detected
+    ///        -3 call depth exceeded, -4 cycle detected, -5 callee
+    ///        over watchdog budget (marked dead)
     ///
     /// The untrusted guest is deliberately not involved: the monitor
     /// runs the callee here, on the caller's monitor stack, and returns
@@ -66,7 +67,8 @@ impl ProcessRuntimeCall for PALContext {
 /// resolves its callee from the channel link instead of an argument.
 ///
 /// Returns 0, or a negative status: -1 unknown/!trustlet callee,
-/// -2 self-call, -3 depth exceeded, -4 cycle.
+/// -2 self-call, -3 depth exceeded, -4 cycle, -5 callee ran past the
+/// invoke watchdog budget (callee marked dead).
 pub fn run_nested(ctx: &mut PALContext, callee_id: u64) -> i64 {
     {
         let caller_id = ctx.process.id;
@@ -158,16 +160,39 @@ pub fn run_nested(ctx: &mut PALContext, callee_id: u64) -> i64 {
             return -1;
         }
 
-        /* Same loop invoke_trustlet runs, one level down. It ends when
-           the callee yields (get_result) or exits. */
+        /* Same loop invoke_trustlet runs, one level down - including
+           its watchdog budget, with the callee's own clock. It ends
+           when the callee yields (get_result) or exits. */
+        let budget = crate::utils::tsc::ticks_for_secs(
+            crate::process_runtime::INVOKE_BUDGET_SECS);
+        let nstart = crate::utils::tsc::rdtsc();
+        let mut status: i64 = 0;
+        callee_ctx.process.invoke_owner_apic = crate::exclusive::get_apic_id();
+        callee_ctx.process.invoke_start_tsc = nstart;
         callee_ctx.process.running = true;
         loop {
             switch_to_vmpl(TRUSTLET_VMPL);
-            if !callee_ctx.handle_process_request() {
+            let cont = callee_ctx.handle_process_request();
+            callee_ctx.process.in_pcall = false;
+            if !cont {
+                break;
+            }
+            if crate::utils::tsc::rdtsc().wrapping_sub(nstart) > budget {
+                /* VMSA fields are unaligned - copy before formatting. */
+                let rip = callee_ctx.vmsa.rip;
+                let rsp = callee_ctx.vmsa.rsp;
+                log::error!("invoke watchdog: nested callee {} over budget ({} s) \
+                             - rip {:#x} rsp {:#x} - marking dead",
+                            callee_id, crate::process_runtime::INVOKE_BUDGET_SECS,
+                            rip, rsp);
+                callee_ctx.mark_dead();
+                status = -5;
                 break;
             }
         }
         callee_ctx.process.running = false;
+        callee_ctx.process.invoke_start_tsc = 0;
+        callee_ctx.process.invoke_owner_apic = u32::MAX;
 
         unsafe { CALL_DEPTH = depth; }
 
@@ -179,6 +204,6 @@ pub fn run_nested(ctx: &mut PALContext, callee_id: u64) -> i64 {
             panic!("call_trustlet: caller VMSA re-registration failed");
         }
 
-        0
+        status
     }
 }

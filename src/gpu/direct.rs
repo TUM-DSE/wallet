@@ -230,6 +230,15 @@ static mut ENGINE_IS_TRUSTLET: [bool; 64] = [false; 64];
    long without the VMPL0-residency IPI hazard. Handled BEFORE any
    relaying, so the next session cannot race the reset. */
 static mut PENDING_SERVICE_STOP: [bool; 64] = [false; 64];
+/* The service page the dead session was relayed to, captured when the
+   stop is armed. The poller often exits poll_engine (registration
+   already nulled) before it can notice the flag, so the stop is
+   delivered at the NEXT session's entry - by which time a NEW service
+   may have registered on this slot. Delivering the stale stop to that
+   fresh service killed it (exit-on-stop) or forced a pointless reset:
+   deliver only while the registration still IS the dead session's
+   service. */
+static mut PENDING_STOP_PAGE: [PhysAddr; 64] = [PhysAddr::null(); 64];
 
 fn heap_for(core: usize) -> (PhysAddr, usize) {
     unsafe {
@@ -498,7 +507,10 @@ pub fn free_engine_slot(core: usize) {
        multi-second service reset at VMPL0 is the parked-CPU IPI
        hazard. */
     if had_session {
-        unsafe { PENDING_SERVICE_STOP[core] = true; }
+        unsafe {
+            PENDING_SERVICE_STOP[core] = true;
+            PENDING_STOP_PAGE[core] = service_page_for(core);
+        }
     }
     log::warn!("engine slot {} freed (owner died)", core);
 }
@@ -594,27 +606,47 @@ pub fn poll_engine(core: usize,
            it, not race it into forward_call's timeout. */
         if ctr.is_some() && unsafe { PENDING_SERVICE_STOP[core] } {
             let sp = service_page_for(core);
-            if sp != PhysAddr::null() {
+            let target = unsafe { PENDING_STOP_PAGE[core] };
+            if sp != PhysAddr::null() && sp != target {
+                /* The registration changed since the stop was armed: a
+                   fresh service replaced the dead session's one. The
+                   stop is for a service that no longer serves this
+                   slot - delivering it here killed the NEW service
+                   (exit-on-stop) or forced a pointless full reset. */
+                log::info!("deferred stop: service on core {} re-registered \
+                            ({:#x?} -> {:#x?}) - stale stop dropped",
+                           core, target, sp);
+            } else if sp != PhysAddr::null() {
                 log::info!("deferred stop -> service page {:#x?} (core {})",
                            sp, core);
                 if let Ok(m) = PerCPUPageMappingGuard::create_4k(sp) {
                     let svc: &mut CommunicationPage =
                         unsafe { &mut *m.virt_addr().as_mut_ptr::<CommunicationPage>() };
-                    let mut acked = false;
-                    for _ in 0..10 {
-                        if forward_call(svc, 500) {
-                            acked = true;
-                            break;
-                        }
-                    }
-                    if acked {
+                    /* ONE attempt, long bound - never a retry loop.
+                       The stop ack means "session reset done" (see
+                       service.c: acking first raced the next session's
+                       fatbin into the relay bound), and a reset can
+                       run 30+ s degraded. Re-sending 500 on a timeout
+                       re-triggers a FULL reset each time: the old
+                       10x30 s retry loop chained ~10 resets into a
+                       ~300 s relay wedge, after which the next
+                       session's first call timed out too, dropped the
+                       registration, and llama fell back to CPU
+                       inference - the whole "slot-recycle darkness"
+                       family. A timeout here now usually just means
+                       the service already exited (exit-on-stop). */
+                    if forward_call_bounded(svc, 500, DEFERRED_STOP_TIMEOUT_SECS) {
                         log::info!("deferred stop acked by service (core {})", core);
                     } else {
-                        log::warn!("deferred stop: service never acked (core {})", core);
+                        log::warn!("deferred stop: no ack (core {}) - service \
+                                    presumed gone", core);
                     }
                 }
             }
-            unsafe { PENDING_SERVICE_STOP[core] = false; }
+            unsafe {
+                PENDING_SERVICE_STOP[core] = false;
+                PENDING_STOP_PAGE[core] = PhysAddr::null();
+            }
             continue;
         }
 
@@ -640,6 +672,11 @@ pub fn poll_engine(core: usize,
                 log::warn!("poll_engine[{}]: alive, waiting on {:#x?} (last id {})",
                            core, engine_phys, last_id);
             }
+            // Watchdog detection: an idle relay plus an over-budget
+            // invoke is the silent-spin signature (rate-limited
+            // inside; one rdtsc per idle spin, same cost argument as
+            // the deadline check above).
+            crate::process_runtime::log_overbudget_invokes(core, last_id as i64);
             continue;
         }
         let call_id = args.id.load(Ordering::Relaxed);
@@ -1144,6 +1181,11 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
 /// recognisable in a client log.
 pub const RELAY_TIMEOUT_ERR: i32 = 802;
 const FORWARD_TIMEOUT_SECS: u64 = 30;
+/// Bound for the deferred session stop: must outlast one full
+/// session_reset (2 s healthy, 30+ s with a degraded MEMLOCK limit),
+/// because the ack only comes after the reset. See the deferred-stop
+/// branch in poll_engine for why this is one attempt, never retried.
+const DEFERRED_STOP_TIMEOUT_SECS: u64 = 120;
 
 /// Relay one call to the service. Returns false if the service did not
 /// answer in time.
@@ -1155,10 +1197,16 @@ const FORWARD_TIMEOUT_SECS: u64 = 30;
 /// happens INSIDE one iteration.
 #[must_use]
 fn forward_call(service: &mut CommunicationPage, call_id: u32) -> bool {
+    forward_call_bounded(service, call_id, FORWARD_TIMEOUT_SECS)
+}
+
+#[must_use]
+fn forward_call_bounded(service: &mut CommunicationPage, call_id: u32,
+                        timeout_secs: u64) -> bool {
     use crate::utils::tsc::{rdtsc, ticks_for_secs};
     service.id.store(call_id, Ordering::Relaxed);
     service.lock.store(1, Ordering::Release);
-    let deadline = rdtsc().wrapping_add(ticks_for_secs(FORWARD_TIMEOUT_SECS));
+    let deadline = rdtsc().wrapping_add(ticks_for_secs(timeout_secs));
     let mut spins: u64 = 0;
     while service.lock.load(Ordering::Acquire) != 0 {
         spins = spins.wrapping_add(1);
@@ -1167,7 +1215,7 @@ fn forward_call(service: &mut CommunicationPage, call_id: u32) -> bool {
         if spins % 4096 == 0 && rdtsc() > deadline {
             log::error!("forward_call: service did not answer id {} within {} s - \
                          failing the call and dropping the service registration",
-                        call_id, FORWARD_TIMEOUT_SECS);
+                        call_id, timeout_secs);
             return false;
         }
     }

@@ -61,6 +61,11 @@ impl ProcessRuntime for PALContext  {
         let rip = vmsa.rip;
         // Advance the trustlet's rip for the next execution (cpuid instruction is 2 bytes)
         vmsa.rip += 2;
+        /* Watchdog attribution: which call this vCPU is inside. The
+           invoke loops clear in_pcall when the handler returns, so a
+           stuck handler reads as in_pcall=true with the culprit rax. */
+        self.process.last_pcall = rax;
+        self.process.in_pcall = true;
         match ProcessCallType(rax) {
             // monitor calls from the Gramine PAL
             ProcessCallType::Fail => {

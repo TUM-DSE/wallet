@@ -110,6 +110,10 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         if(heartbeat % 1000000000 == 0) {
             log::warn!("shuttle heartbeat: {}", heartbeat);
         }
+        // Watchdog detection for invokes with no GPU channel yet (the
+        // engine-registered case runs the same scan inside
+        // poll_engine's idle branch). Rate-limited inside.
+        crate::process_runtime::log_overbudget_invokes(id, -1);
     }
 
     unsafe {

@@ -187,6 +187,23 @@ pub struct TrustedProcess {
     /// never exited (F4 - session trustlets park between invokes and
     /// are deleted while idle-alive).
     pub running: bool,
+    /// APIC id of the vCPU inside this trustlet's invoke loop
+    /// (u32::MAX = none). Attribution for the watchdog only; written
+    /// only by the owning vCPU, donated pollers just read it.
+    pub invoke_owner_apic: u32,
+    /// rdtsc at invoke entry (0 = no invoke in flight). Same ownership
+    /// contract as invoke_owner_apic; the poller compares it against
+    /// INVOKE_BUDGET_SECS to spot invokes the in-loop watchdog cannot
+    /// reach (silent VMPL1 spins).
+    pub invoke_start_tsc: u64,
+    /// rax of the last process call dispatched for this trustlet, and
+    /// whether the vCPU is still inside its handler. Written by the
+    /// owning vCPU (handle_process_request entry / invoke-loop
+    /// return); the watchdog poller reads them to split "stuck inside
+    /// monitor call X" from "spinning silently at VMPL1 after call X"
+    /// - the two stall families need different fixes.
+    pub last_pcall: u64,
+    pub in_pcall: bool,
 }
 
 impl ProcessBaseContext {
@@ -253,6 +270,10 @@ impl TrustedProcess {
             dead: false,
             gpu_core: -1,
             running: false,
+            invoke_owner_apic: u32::MAX,
+            invoke_start_tsc: 0,
+            last_pcall: 0,
+            in_pcall: false,
         }
 
     }
@@ -339,6 +360,10 @@ impl TrustedProcess {
             dead: false,
             gpu_core: -1,
             running: false,
+            invoke_owner_apic: u32::MAX,
+            invoke_start_tsc: 0,
+            last_pcall: 0,
+            in_pcall: false,
         }
     }
 }

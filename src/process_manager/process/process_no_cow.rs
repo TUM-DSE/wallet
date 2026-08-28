@@ -93,6 +93,10 @@ impl TrustedProcess {
             pf_target_vaddr: 0,
             dead: false,
             gpu_core: -1,
+            invoke_owner_apic: u32::MAX,
+            invoke_start_tsc: 0,
+            last_pcall: 0,
+            in_pcall: false,
         }
     }
 
