@@ -310,6 +310,38 @@ impl ProcessMemConfig{
         self.free_page_list_used_len += 1;
     }
 
+    /// Batch pop/bump under ONE lock hold: up to out.len() pages,
+    /// free list first (LIFO), then the bump region. Pool pops only
+    /// null the list slot - no zero, no per-page mapping guard; bump
+    /// advances page_base WITHOUT validate_and_clear. Caller contract
+    /// on allocate_pages_batch_unzeroed.
+    fn get_free_pages_batch(&mut self, out: &mut [PhysAddr]) -> (usize, usize) {
+        let mut n = 0;
+        while n < out.len() && self.free_page_list_used_len > 0 {
+            self.free_page_list_used_len -= 1;
+            let addr = self.free_page_list
+                + (self.free_page_list_used_len as u64 * ADDRESS_LENGTH);
+            let entry: &mut PhysAddr = unsafe { &mut *(addr as *mut PhysAddr) };
+            out[n] = *entry;
+            *entry = PhysAddr::null();
+            n += 1;
+        }
+        let pool_n = n;
+        while n < out.len() {
+            if self.page_base.bits() as u64 + PAGE_SIZE as u64
+                > self.page_limit.bits() as u64
+            {
+                log::error!("get_free_pages_batch: monitor memory region exhausted at {:#x?}",
+                            self.page_base);
+                break;
+            }
+            out[n] = self.page_base;
+            self.page_base = self.page_base + PAGE_SIZE;
+            n += 1;
+        }
+        (pool_n, n)
+    }
+
     fn allocated_amount(&mut self) -> usize {
         self.page_base.bits() - self.free_page_list_used_len * PAGE_SIZE
     }
@@ -385,6 +417,15 @@ pub fn allocate_vmsa_page() -> PhysAddr {
 
 pub fn free_page(addr: PhysAddr) {
     PROCESS_MEM_CONFIG.lock().add_free_page(addr)
+}
+
+/// Up to out.len() pages under ONE lock acquisition (the model-store
+/// fill path; get_free_page's zeroed-page contract stays untouched).
+/// out[..pool_n]: free-list pages (pvalidated, contents STALE - the
+/// caller MUST zero before ANY non-VMPL0 grant); out[pool_n..n]: bump
+/// pages (NOT pvalidated, NOT zeroed). n < out.len() = exhaustion.
+pub fn allocate_pages_batch_unzeroed(out: &mut [PhysAddr]) -> (usize, usize) {
+    PROCESS_MEM_CONFIG.lock().get_free_pages_batch(out)
 }
 
 pub fn allocated_amount() -> usize {

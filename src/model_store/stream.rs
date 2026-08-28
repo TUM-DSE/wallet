@@ -20,14 +20,14 @@ use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::process_manager::allocation::AllocationRange;
-use crate::process_manager::process_paging::{ProcessPageFlags, ProcessPageTableEntry,
-                                             ProcessPageTablePage, ProcessPageTableRef};
-use crate::process_manager::memory_helper::strip_c_bit;
+use crate::process_manager::process_paging::{ProcessPageFlags, ProcessPageTablePage,
+                                             ProcessPageTableRef, ProcessTableLevelMapping};
 use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::interop::memory::read_cr3;
-use crate::sev::{rmp_adjust, RMPFlags};
+use crate::sev::{pvalidate, rmp_adjust, PvalidateOp, RMPFlags, SevSnpError};
+use crate::sev::utils::SvsmError;
 use crate::types::PageSize;
-use crate::{map_paddr, paddr_as_table, strip_paddr};
+use crate::{map_paddr, paddr_as_table};
 use crate::{MonitorError, RequestParams};
 
 /// Guest request flag (rdx): allocate the rest synchronously on the
@@ -84,49 +84,173 @@ static WORKER_HASHER: AtomicU64 = AtomicU64::new(0);
 static WORKER_MOUNTED: AtomicU64 = AtomicU64::new(0);
 static WORKER_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+/// The mounted flat VA of the store window (slot-6 mount).
+const ALLOC_VA: u64 = 0x30000000000;
+
+/// Fill instrumentation: rdtsc deltas per fill_unit phase, reset in
+/// begin(), appended to finish()'s measure line AFTER streamed= (the
+/// hashing lane's sed carries a trailing .* - appending is safe). No
+/// capture() here: one outb per unit is a VM exit (F9).
+static T_LOCK_TSC: AtomicU64 = AtomicU64::new(0);
+static T_TABLE_TSC: AtomicU64 = AtomicU64::new(0);
+static T_PTE_TSC: AtomicU64 = AtomicU64::new(0);
+static T_PVAL_TSC: AtomicU64 = AtomicU64::new(0);
+static T_ZERO_TSC: AtomicU64 = AtomicU64::new(0);
+static T_RMP_TSC: AtomicU64 = AtomicU64::new(0);
+
 fn pages_of(bytes: u64) -> u64 {
     bytes.div_ceil(4096)
 }
 
-/// Grant the GUEST (VMPL2) access to the page-TABLE pages covering
-/// data pages [from_page, to_page) of the range's subtree. inflate()
-/// allocates new PMD/PTE table pages with only the VMPL1 grant the
-/// channel paths need - but the guest's hardware walker must READ
-/// them (and write A/D bits), or the first touch of a grown page
-/// nested-faults forever (found on hardware: register hung in a
-/// silent, killable fault loop on byte one past the initial chunk).
-/// Mirrors guest_write_access()'s table pass, bounded to the chunk:
-/// one PTE page per 2 MB + one PMD page per 1 GB + the PUD page.
-fn grant_tables_for(range0: u64, from_page: u64, to_page: u64) {
-    let pgd_entry = ProcessPageTableEntry(PhysAddr::from(range0));
-    let (m1, pud_table) = paddr_as_table!(strip_paddr!(pgd_entry.0));
-    let _ = rmp_adjust(m1.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX,
-                       PageSize::Regular);
-    let pud_from = (from_page >> 18) as usize; // 512*512 pages per PUD entry
-    let pud_to = ((to_page - 1) >> 18) as usize;
-    for pi in pud_from..=pud_to {
-        let pud_entry = pud_table[pi];
-        if !pud_entry.flags().contains(ProcessPageFlags::PRESENT) {
-            continue;
-        }
-        let (m2, pmd_table) = paddr_as_table!(strip_paddr!(pud_entry.0));
-        let _ = rmp_adjust(m2.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX,
-                           PageSize::Regular);
-        let base = (pi as u64) << 18;
-        let lo = core::cmp::max(from_page, base);
-        let hi = core::cmp::min(to_page, base + (1 << 18));
-        let pmd_from = ((lo - base) >> 9) as usize;
-        let pmd_to = ((hi - 1 - base) >> 9) as usize;
-        for mi in pmd_from..=pmd_to {
-            let pmd_entry = pmd_table[mi];
-            if !pmd_entry.flags().contains(ProcessPageFlags::PRESENT) {
-                continue;
+/// A fresh, ZEROED page-table page for the store subtree, granted
+/// VMPL1|RWX + VMPL2|RWX at creation: the VMPL1 walker and the guest's
+/// hardware walker both READ table pages (and write A/D bits) - grant
+/// once here instead of per chunk (the old grant_tables_for pass) or
+/// per data page (map_4k_page's 512x-redundant PTE-table RMPADJUST).
+/// allocate_page keeps its zeroed-page contract for table pages (F7).
+fn new_granted_table_page() -> PhysAddr {
+    let page = crate::process_manager::process_memory::allocate_page();
+    let (guard, _va) = map_paddr!(page);
+    rmp_adjust(guard.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX,
+               PageSize::Regular).unwrap();
+    rmp_adjust(guard.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX,
+               PageSize::Regular).unwrap();
+    page
+}
+
+/// Walk-and-create to the PTE table covering `va` (under the calling
+/// task's slot-6 mount), reusing page_walk's deepest-present handle.
+/// Missing PMD/PTE tables come from new_granted_table_page. The PGD
+/// arm is unreachable while the range is mounted - hitting it means
+/// the caller forgot to mount, which nothing downstream survives.
+fn ensure_pte_table(pt: &ProcessPageTableRef, va: VirtAddr) -> PhysAddr {
+    let table_flags = ProcessPageFlags::PRESENT | ProcessPageFlags::WRITABLE
+        | ProcessPageFlags::USER_ACCESSIBLE | ProcessPageFlags::ACCESSED;
+    loop {
+        let (_g, pgd_table) = paddr_as_table!(pt.process_page_table);
+        match pt.page_walk(&pgd_table, pt.process_page_table, va) {
+            ProcessTableLevelMapping::PTE(table_phys, _idx) => return table_phys,
+            ProcessTableLevelMapping::PMD(pmd_phys, idx) => {
+                let new = new_granted_table_page();
+                let (_g2, pmd_table) = paddr_as_table!(pmd_phys);
+                pmd_table[idx].set(new, table_flags);
+                return new;
             }
-            let (m3, _pte_table) = paddr_as_table!(strip_paddr!(pmd_entry.0));
-            let _ = rmp_adjust(m3.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX,
-                               PageSize::Regular);
+            ProcessTableLevelMapping::PUD(pud_phys, idx) => {
+                let new = new_granted_table_page();
+                let (_g2, pud_table) = paddr_as_table!(pud_phys);
+                pud_table[idx].set(new, table_flags);
+                // loop: the re-walk descends into the new PMD table
+                // and creates the PTE table (once per GiB - cheap).
+            }
+            ProcessTableLevelMapping::PGD(..) => {
+                panic!("ensure_pte_table: range not mounted at slot 6");
+            }
         }
     }
+}
+
+/// Fused fill of pages [start_page, start_page+count) of the mounted
+/// range - ONE PTE table (count <= 512, never crossing a table
+/// boundary), through the slot-6 mount. Order is load-bearing:
+/// (1) install PTEs (one guard, direct writes - no per-page walk),
+/// (2) pvalidate the BUMP-origin pages via the mounted VA (pool pages
+///     are pre-validated; FAIL_UNCHANGED = already valid = skip),
+/// (3) zero ALL pages via the mounted VA - pool pages carry
+///     freed-trustlet/model data; the zero MUST precede any grant
+///     issued here (confidentiality),
+/// (4) grant VMPL1|RWX + VMPL2|RWX per page via the mounted VA.
+/// Not-present->present PTEs need no TLB flush (monitor task and
+/// guest walker alike), and pvalidate/rmp_adjust are VA-based, so a
+/// guest racing the watermark can only fault-loop itself - no monitor
+/// invariant rests on it.
+/// false = allocator exhausted: the pages obtained are installed AND
+/// validated (delete()'s presence walk recovers them into the free
+/// list, whose contract is "pvalidated"), nothing further is; FAILED
+/// is set for the guest.
+fn fill_unit(pt: &ProcessPageTableRef, start_page: u64, count: usize) -> bool {
+    use crate::utils::tsc::rdtsc;
+    debug_assert!(count >= 1 && (start_page as usize & 0x1ff) + count <= 512);
+    let va = ALLOC_VA + start_page * 4096;
+
+    let t0 = rdtsc();
+    let pte_phys = ensure_pte_table(pt, VirtAddr::from(va));
+    let t1 = rdtsc();
+    T_TABLE_TSC.fetch_add(t1.wrapping_sub(t0), Ordering::SeqCst);
+
+    let mut pages = [PhysAddr::null(); 512];
+    let (pool_n, n) = crate::process_manager::process_memory::allocate_pages_batch_unzeroed(&mut pages[..count]);
+    let t2 = rdtsc();
+    T_LOCK_TSC.fetch_add(t2.wrapping_sub(t1), Ordering::SeqCst);
+
+    let data_flags = ProcessPageFlags::PRESENT | ProcessPageFlags::WRITABLE
+        | ProcessPageFlags::DIRTY | ProcessPageFlags::ACCESSED
+        | ProcessPageFlags::USER_ACCESSIBLE;
+    {
+        let (_g, pte_table) = paddr_as_table!(pte_phys);
+        let idx0 = start_page as usize & 0x1ff;
+        for i in 0..n {
+            pte_table[idx0 + i].set(pages[i], data_flags);
+        }
+    }
+    let t3 = rdtsc();
+    T_PTE_TSC.fetch_add(t3.wrapping_sub(t2), Ordering::SeqCst);
+
+    /* Bump pages only: pool pages are pre-validated. Sub-batches keep
+       the pvalidate read-lock hold short (core_create_vcpu takes the
+       write side). */
+    let mut i = pool_n;
+    while i < n {
+        let end = core::cmp::min(i + 64, n);
+        let lock = crate::locking::get_pvalidate_lock().lock_read();
+        for j in i..end {
+            match pvalidate(VirtAddr::from(va + j as u64 * 4096),
+                            PageSize::Regular, PvalidateOp::Valid) {
+                Ok(()) => (),
+                /* Already valid (a re-installed page after a failed
+                   unit): exactly the state we need. An explicit skip,
+                   never a blanket ign_cf. */
+                Err(SvsmError::SevSnp(SevSnpError::FAIL_UNCHANGED(_))) => (),
+                /* Anything else is a monitor bug; a soft failure here
+                   would let delete() feed unvalidated pages into the
+                   free list. Same severity as validate_and_clear's
+                   unwrap. */
+                Err(e) => panic!("fill_unit: pvalidate {:#x}: {:?}",
+                                 va + j as u64 * 4096, e),
+            }
+        }
+        drop(lock);
+        i = end;
+    }
+    let t4 = rdtsc();
+    T_PVAL_TSC.fetch_add(t4.wrapping_sub(t3), Ordering::SeqCst);
+
+    if n < count {
+        log::warn!("model stream: allocator exhausted mid-unit ({} of {} pages) - \
+                    failing the stream", n, count);
+        FAILED.store(1, Ordering::SeqCst);
+        return false;
+    }
+
+    /* Zero through the mounted VA BEFORE step (4) issues any grant.
+       Recycled pool pages may still carry a stale VMPL2 grant from a
+       previous model (delete() reclaims without revoking) - those
+       bytes were guest-visible in their prior life, so the window
+       discloses nothing new; fresh bump pages stay RMP-blocked for
+       every non-VMPL0 access until (4). */
+    unsafe {
+        core::ptr::write_bytes(va as *mut u8, 0, count * 4096);
+    }
+    let t5 = rdtsc();
+    T_ZERO_TSC.fetch_add(t5.wrapping_sub(t4), Ordering::SeqCst);
+
+    for k in 0..count {
+        let page_va = VirtAddr::from(va + k as u64 * 4096);
+        let _ = rmp_adjust(page_va, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular);
+        let _ = rmp_adjust(page_va, RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
+    }
+    T_RMP_TSC.fetch_add(rdtsc().wrapping_sub(t5), Ordering::SeqCst);
+    true
 }
 
 /// Arm the stream. Called from load_init on the loading vCPU, after
@@ -157,6 +281,12 @@ pub fn begin(range: &AllocationRange, total_bytes: u64) {
     HASHED.store(0, Ordering::SeqCst);
     HASH_TSC.store(0, Ordering::SeqCst);
     ALLOC_TSC.store(0, Ordering::SeqCst);
+    T_LOCK_TSC.store(0, Ordering::SeqCst);
+    T_TABLE_TSC.store(0, Ordering::SeqCst);
+    T_PTE_TSC.store(0, Ordering::SeqCst);
+    T_PVAL_TSC.store(0, Ordering::SeqCst);
+    T_ZERO_TSC.store(0, Ordering::SeqCst);
+    T_RMP_TSC.store(0, Ordering::SeqCst);
     BEGIN_TSC.store(crate::utils::tsc::rdtsc(), Ordering::SeqCst);
     FAILED.store(0, Ordering::SeqCst);
     DONE.store(0, Ordering::SeqCst);
@@ -168,18 +298,25 @@ pub fn begin(range: &AllocationRange, total_bytes: u64) {
 /// Grow the window to `new_pages` and grant the NEW tail to the
 /// guest. Runs on whoever holds the WORKER claim (donated worker or
 /// the eager guest vCPU); requires the range mounted on the CALLING
-/// task's PML4 (mounts are per-task private). inflate() alone is not
-/// enough: it skips the VMPL2 grant, and its new mappings need no TLB
-/// shootdown (not-present -> present is never cached; the trustlet
-/// heap-grow path documents the same argument).
+/// task's PML4 (mounts are per-task private). Fused per-2MB fill:
+/// fill_unit installs PTEs, validates, zeroes and grants one PTE
+/// table per pass, and new table pages are granted at creation - no
+/// inflate/map_4k_page walk, no grant_tables_for chunk pass, no
+/// per-page VMPL2 loop. The new mappings need no TLB shootdown
+/// (not-present -> present is never cached; the trustlet heap-grow
+/// path documents the same argument). RANGE_PAGES/WATERMARK publish
+/// per unit, so the guest unblocks progressively.
 fn grow_to(new_pages: u64) -> bool {
     let cur = RANGE_PAGES.load(Ordering::SeqCst);
     if new_pages <= cur {
         return true;
     }
     let need = new_pages - cur;
+    /* need/512: the PTE-table pages the fill itself allocates (PMD/
+       PUD are covered by the margin) - the margin alone does not
+       cover a 120B eager fill's ~31k table pages. */
     if crate::process_manager::process_memory::pages_available()
-        < need + ALLOC_MARGIN_PAGES
+        < need + need / 512 + ALLOC_MARGIN_PAGES
     {
         log::warn!("model stream: {} pages needed, allocator low - failing the stream",
                    need);
@@ -187,22 +324,21 @@ fn grow_to(new_pages: u64) -> bool {
         return false;
     }
     let t0 = crate::utils::tsc::rdtsc();
-    let mut range = AllocationRange(RANGE0.load(Ordering::SeqCst), cur);
     let mut pt = ProcessPageTableRef::default();
     pt.set_external_table(read_cr3().bits() as u64);
-    range.inflate(&mut pt, new_pages, 0x30000000000u64);
-    /* The VMPL2 grants inflate() does not do: the NEW table pages
-       (the guest's walker must read them - without this the first
-       touch of a grown page fault-loops), then the tail data pages
-       via the mounted VA (the data half of guest_write_access). */
-    grant_tables_for(range.0, cur, new_pages);
-    for i in cur..new_pages {
-        let _ = rmp_adjust(VirtAddr::from(0x30000000000u64 + i * 4096),
-                           RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
-    }
-    RANGE_PAGES.store(new_pages, Ordering::SeqCst);
     let total = TOTAL.load(Ordering::SeqCst);
-    WATERMARK.store(core::cmp::min(new_pages * 4096, total), Ordering::SeqCst);
+    let mut page = cur;
+    while page < new_pages {
+        let count = core::cmp::min(512 - (page & 0x1ff), new_pages - page) as usize;
+        if !fill_unit(&pt, page, count) {
+            ALLOC_TSC.fetch_add(crate::utils::tsc::rdtsc().wrapping_sub(t0),
+                                Ordering::SeqCst);
+            return false;
+        }
+        page += count as u64;
+        RANGE_PAGES.store(page, Ordering::SeqCst);
+        WATERMARK.store(core::cmp::min(page * 4096, total), Ordering::SeqCst);
+    }
     ALLOC_TSC.fetch_add(crate::utils::tsc::rdtsc().wrapping_sub(t0), Ordering::SeqCst);
     true
 }
@@ -410,11 +546,19 @@ pub fn finish() -> Option<[u8; 64]> {
     ACTIVE.store(0, Ordering::SeqCst);
     EPOCH.fetch_add(1, Ordering::SeqCst);
     let ms = |tsc: u64| tsc / (TSC_HZ / 1000);
-    log::info!("model measure: {} B hash_ms={} alloc_ms={} wall_ms={} streamed={}",
+    log::info!("model measure: {} B hash_ms={} alloc_ms={} wall_ms={} streamed={} \
+                alloc_lock_ms={} alloc_pte_ms={} alloc_pval_ms={} alloc_zero_ms={} \
+                alloc_rmp_ms={} alloc_table_ms={}",
                TOTAL.load(Ordering::SeqCst),
                ms(HASH_TSC.load(Ordering::SeqCst)),
                ms(ALLOC_TSC.load(Ordering::SeqCst)),
                ms(rdtsc().wrapping_sub(BEGIN_TSC.load(Ordering::SeqCst))),
-               digest.is_some() as u32);
+               digest.is_some() as u32,
+               ms(T_LOCK_TSC.load(Ordering::SeqCst)),
+               ms(T_PTE_TSC.load(Ordering::SeqCst)),
+               ms(T_PVAL_TSC.load(Ordering::SeqCst)),
+               ms(T_ZERO_TSC.load(Ordering::SeqCst)),
+               ms(T_RMP_TSC.load(Ordering::SeqCst)),
+               ms(T_TABLE_TSC.load(Ordering::SeqCst)));
     digest
 }
