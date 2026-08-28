@@ -1,6 +1,6 @@
 use super::super::PALContext;
 use crate::process_runtime::{ReturnTarget, RETURN_TO_GUEST, RETURN_TO_PROCESS};
-use crate::{address::VirtAddr, map_paddr, process_manager::process_paging::ProcessPageTableRef};
+use crate::{address::{PhysAddr, VirtAddr}, map_paddr, process_manager::process_paging::ProcessPageTableRef};
 use crate::memory::paging::PerCPUPageMappingGuard;
 
 use super::super::TrustletReturnType;
@@ -23,12 +23,25 @@ impl ProcessRuntimeException for PALContext {
                 log::info!("[Trustlet] #GP: CR2=0x{:x}, error_code = {}", cr2, error_code);
                 let mut process_page_table_ref = ProcessPageTableRef::default();
                 process_page_table_ref.set_external_table(self.vmsa.cr3);
-                // dump stack
+                /* Dump stack - clamped to the ONE page map_paddr! maps.
+                   An rsp within 64 bytes of its page end walked this
+                   read off the mapping and #GP'd the SVSM itself: the
+                   invoking vCPU died in the panic handler, the invoke
+                   never returned, and the guest lost the CPU - the
+                   init-stall guest-killer (captured 2026-08-28, run 2
+                   of the same-engine recycle loop). A diagnostic must
+                   never out-crash the crash it reports. */
                 let stack_base_paddr = process_page_table_ref.get_page(VirtAddr::from(rsp));
-                let offset = (rsp & 0xFFF) / 8;
-                let (_mapping, stack_mapping) = map_paddr!(stack_base_paddr);
-                for i in 0..9 {
-                    log::info!("[Trustlet] Stack (rsp+{}): {:#x}", i*8, unsafe{stack_mapping.as_ptr::<u64>().offset((offset + i).try_into().unwrap()).read()});
+                if stack_base_paddr != PhysAddr::null() {
+                    let offset = (rsp & 0xFFF) / 8;
+                    let in_page = (512u64).saturating_sub(offset);
+                    let n = core::cmp::min(9, in_page);
+                    let (_mapping, stack_mapping) = map_paddr!(stack_base_paddr);
+                    for i in 0..n {
+                        log::info!("[Trustlet] Stack (rsp+{}): {:#x}", i*8, unsafe{stack_mapping.as_ptr::<u64>().offset((offset + i).try_into().unwrap()).read()});
+                    }
+                } else {
+                    log::info!("[Trustlet] Stack: rsp {:#x} not mapped - no dump", rsp);
                 }
                 let efer = self.vmsa.efer;
                 let rip = self.vmsa.rip;
@@ -147,12 +160,25 @@ impl ProcessRuntimeException for PALContext {
                 log::info!("vmsa rsp: {:?}", rsp);
                 let mut process_page_table_ref = ProcessPageTableRef::default();
                 process_page_table_ref.set_external_table(self.vmsa.cr3);
-                // dump stack
+                /* Dump stack - clamped to the ONE page map_paddr! maps.
+                   An rsp within 64 bytes of its page end walked this
+                   read off the mapping and #GP'd the SVSM itself: the
+                   invoking vCPU died in the panic handler, the invoke
+                   never returned, and the guest lost the CPU - the
+                   init-stall guest-killer (captured 2026-08-28, run 2
+                   of the same-engine recycle loop). A diagnostic must
+                   never out-crash the crash it reports. */
                 let stack_base_paddr = process_page_table_ref.get_page(VirtAddr::from(rsp));
-                let offset = (rsp & 0xFFF) / 8;
-                let (_mapping, stack_mapping) = map_paddr!(stack_base_paddr);
-                for i in 0..9 {
-                    log::info!("[Trustlet] Stack (rsp+{}): {:#x}", i*8, unsafe{stack_mapping.as_ptr::<u64>().offset((offset + i).try_into().unwrap()).read()});
+                if stack_base_paddr != PhysAddr::null() {
+                    let offset = (rsp & 0xFFF) / 8;
+                    let in_page = (512u64).saturating_sub(offset);
+                    let n = core::cmp::min(9, in_page);
+                    let (_mapping, stack_mapping) = map_paddr!(stack_base_paddr);
+                    for i in 0..n {
+                        log::info!("[Trustlet] Stack (rsp+{}): {:#x}", i*8, unsafe{stack_mapping.as_ptr::<u64>().offset((offset + i).try_into().unwrap()).read()});
+                    }
+                } else {
+                    log::info!("[Trustlet] Stack: rsp {:#x} not mapped - no dump", rsp);
                 }
 
                 /*
