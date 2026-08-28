@@ -27,7 +27,7 @@ use crate::interop::memory::read_cr3;
 use crate::sev::{pvalidate, rmp_adjust, PvalidateOp, RMPFlags, SevSnpError};
 use crate::sev::utils::SvsmError;
 use crate::types::PageSize;
-use crate::{map_paddr, paddr_as_table};
+use crate::{map_paddr, paddr_as_table, paddr_as_u64_slice, vaddr_as_u64_slice};
 use crate::{MonitorError, RequestParams};
 
 /// Guest request flag (rdx): allocate the rest synchronously on the
@@ -80,12 +80,45 @@ static WORKER: AtomicI64 = AtomicI64::new(WORKER_NONE);
 /// Written by the worker before the DONE release-store; read by
 /// finish() after the DONE acquire-load.
 static mut DIGEST: [u8; 64] = [0; 64];
-/// Worker-only after claim: hacl sha512 state handle, mount flag and
-/// the epoch the claim belongs to (a bumped epoch = this load was
-/// cancelled or superseded - abort without touching the digest).
+/// Worker-claim bookkeeping. The hacl sha512 handle is a core-
+/// agnostic heap pointer: preserved (with HASHED) across a graceful
+/// GPU detach, keyed by HASHER_EPOCH + HASHER_LIVE so a re-claimer
+/// RESUMES instead of restarting - and never resumes a freed handle
+/// (sha512_digest frees it) or another load's (epoch mismatch).
+/// WORKER_EPOCH is the claim's epoch; a bump means this load was
+/// cancelled or superseded - abort without touching the digest.
 static WORKER_HASHER: AtomicU64 = AtomicU64::new(0);
-static WORKER_MOUNTED: AtomicU64 = AtomicU64::new(0);
 static WORKER_EPOCH: AtomicU64 = AtomicU64::new(0);
+static HASHER_EPOCH: AtomicU64 = AtomicU64::new(0);
+static HASHER_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Parallel-fill state. Unit u = pages [u*512, min((u+1)*512, total))
+/// - exactly one PTE table. ALLOC_NEXT is the CAS-only claim cursor
+/// (F8: never a blind fetch_add past what is published);
+/// ALLOC_PUBLISHED counts units whose PTE tables the coordinator has
+/// created (helpers claim only below it, so table creation stays
+/// single-writer); UNIT_DONE bits are set with Release by the filler
+/// and swept with Acquire by the coordinator - the ONLY non-SeqCst
+/// pair in this file, ordering a unit's PTE/pvalidate/zero/grant
+/// writes before the watermark that exposes them. SWEEP_UNIT is the
+/// completed prefix. MOUNT_EPOCH[core] = the epoch whose range this
+/// core mounted at its own slot 6 (0 = none; EPOCH starts at 1).
+/// HELPERS_BUSY counts helpers inside a quantum - begin()/finish()/
+/// the eager arm drain it before touching state a straggler uses.
+/// ALLOC_T0 = rdtsc at the first claim with units outstanding;
+/// ALLOC_TSC becomes the SPAN to the last unit's completion (the
+/// parallel fill's wall clock, ~linear in the worker count - the T_*
+/// buckets stay per-core work SUMS), except on the eager path where
+/// grow_to's own measured time lands as before.
+#[allow(clippy::declare_interior_mutable_const)]
+const AU64_ZERO: AtomicU64 = AtomicU64::new(0);
+static ALLOC_NEXT: AtomicU64 = AtomicU64::new(0);
+static ALLOC_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static SWEEP_UNIT: AtomicU64 = AtomicU64::new(0);
+static UNIT_DONE: [AtomicU64; 2048] = [AU64_ZERO; 2048];
+static MOUNT_EPOCH: [AtomicU64; 64] = [AU64_ZERO; 64];
+static HELPERS_BUSY: AtomicU64 = AtomicU64::new(0);
+static ALLOC_T0: AtomicU64 = AtomicU64::new(0);
 
 /// The mounted flat VA of the store window (slot-6 mount).
 const ALLOC_VA: u64 = 0x30000000000;
@@ -103,6 +136,66 @@ static T_RMP_TSC: AtomicU64 = AtomicU64::new(0);
 
 fn pages_of(bytes: u64) -> u64 {
     bytes.div_ceil(4096)
+}
+
+fn unit_done(u: u64) -> bool {
+    UNIT_DONE[(u / 64) as usize].load(Ordering::Acquire) & (1u64 << (u % 64)) != 0
+}
+
+fn set_unit_done(u: u64) {
+    UNIT_DONE[(u / 64) as usize].fetch_or(1u64 << (u % 64), Ordering::Release);
+}
+
+/// This task's page-table handle (the walk root for the slot-6 walk).
+fn own_pt() -> ProcessPageTableRef {
+    let mut pt = ProcessPageTableRef::default();
+    pt.set_external_table(read_cr3().bits() as u64);
+    pt
+}
+
+/// Clear THIS task's slot-6 mount directly: a helper after an epoch
+/// change cannot rely on RANGE0 still describing its stale mount, so
+/// no AllocationRange bookkeeping - mounts are per-task private.
+fn unmount_own_slot() {
+    let (_m, pgd) = paddr_as_u64_slice!(read_cr3());
+    pgd[crate::process_manager::allocation::DEFAULT_ALLOCATION_RANGE_MOUNT] = 0;
+    crate::interop::memory::flush_tlb_global();
+}
+
+/// Drop this core's claim (if it holds one) and its slot-6 mount.
+/// Hash state is deliberately NOT touched - that is the preservation
+/// detach_core relies on; a stale preserved handle is fenced by the
+/// epoch check at the next claim and leaks at worst (parity with the
+/// old abort path, which never freed it either).
+fn release_core(core: usize) {
+    if WORKER.load(Ordering::SeqCst) == core as i64 {
+        WORKER.store(WORKER_NONE, Ordering::SeqCst);
+    }
+    if MOUNT_EPOCH[core].load(Ordering::SeqCst) != 0
+        && MOUNT_EPOCH[core].swap(0, Ordering::SeqCst) != 0
+    {
+        unmount_own_slot();
+    }
+}
+
+/// Graceful coordinator hand-off, called by the exclusive loop
+/// immediately BEFORE it enters poll_engine for a GPU session: that
+/// branch precedes the poll_worker call and blocks for the whole
+/// session, so a claim held into it starved the stream while
+/// STATE_CLAIMED kept the guest's eager fallback off - the writer
+/// spun on the watermark FOREVER. Releasing preserves the hash state
+/// (see release_core) so the next claimer RESUMES; with no free
+/// donated core left, CLAIMED clears and the guest's existing 2 s
+/// eager fallback fires. Feature-independent: no crypto symbols, so
+/// the rustcrypto/boottime builds (whose poll_worker is a stub) link
+/// it unchanged.
+pub fn detach_core(core: usize) {
+    if WORKER.load(Ordering::SeqCst) == core as i64 {
+        log::info!("model stream: worker on core {} detaching for a GPU session \
+                    ({} B hashed, state preserved)",
+                   core, HASHED.load(Ordering::SeqCst));
+    }
+    release_core(core);
 }
 
 /// A fresh, ZEROED page-table page for the store subtree, granted
@@ -126,7 +219,10 @@ fn new_granted_table_page() -> PhysAddr {
 /// Missing PMD/PTE tables come from new_granted_table_page. The PGD
 /// arm is unreachable while the range is mounted - hitting it means
 /// the caller forgot to mount, which nothing downstream survives.
-fn ensure_pte_table(pt: &ProcessPageTableRef, va: VirtAddr) -> PhysAddr {
+/// `create: false` = lookup only (helpers, whose units the
+/// coordinator published): a missing table there is an invariant
+/// violation, not a request to race the skeleton - panic.
+fn ensure_pte_table(pt: &ProcessPageTableRef, va: VirtAddr, create: bool) -> PhysAddr {
     let table_flags = ProcessPageFlags::PRESENT | ProcessPageFlags::WRITABLE
         | ProcessPageFlags::USER_ACCESSIBLE | ProcessPageFlags::ACCESSED;
     loop {
@@ -134,12 +230,18 @@ fn ensure_pte_table(pt: &ProcessPageTableRef, va: VirtAddr) -> PhysAddr {
         match pt.page_walk(&pgd_table, pt.process_page_table, va) {
             ProcessTableLevelMapping::PTE(table_phys, _idx) => return table_phys,
             ProcessTableLevelMapping::PMD(pmd_phys, idx) => {
+                if !create {
+                    panic!("ensure_pte_table: unpublished unit at {:#x}", u64::from(va));
+                }
                 let new = new_granted_table_page();
                 let (_g2, pmd_table) = paddr_as_table!(pmd_phys);
                 pmd_table[idx].set(new, table_flags);
                 return new;
             }
             ProcessTableLevelMapping::PUD(pud_phys, idx) => {
+                if !create {
+                    panic!("ensure_pte_table: unpublished unit at {:#x}", u64::from(va));
+                }
                 let new = new_granted_table_page();
                 let (_g2, pud_table) = paddr_as_table!(pud_phys);
                 pud_table[idx].set(new, table_flags);
@@ -175,13 +277,14 @@ fn ensure_pte_table(pt: &ProcessPageTableRef, va: VirtAddr) -> PhysAddr {
 /// validated (delete()'s presence walk recovers them into the free
 /// list, whose contract is "pvalidated"), nothing further is; FAILED
 /// is set for the guest.
-fn fill_unit(pt: &ProcessPageTableRef, start_page: u64, count: usize) -> bool {
+fn fill_unit(pt: &ProcessPageTableRef, start_page: u64, count: usize,
+             create_tables: bool) -> bool {
     use crate::utils::tsc::rdtsc;
     debug_assert!(count >= 1 && (start_page as usize & 0x1ff) + count <= 512);
     let va = ALLOC_VA + start_page * 4096;
 
     let t0 = rdtsc();
-    let pte_phys = ensure_pte_table(pt, VirtAddr::from(va));
+    let pte_phys = ensure_pte_table(pt, VirtAddr::from(va), create_tables);
     let t1 = rdtsc();
     T_TABLE_TSC.fetch_add(t1.wrapping_sub(t0), Ordering::SeqCst);
 
@@ -270,11 +373,14 @@ pub fn begin(range: &AllocationRange, total_bytes: u64) {
     ACTIVE.store(0, Ordering::SeqCst);
     let deadline = crate::utils::tsc::rdtsc()
         .wrapping_add(crate::utils::tsc::ticks_for_secs(2));
-    while WORKER.load(Ordering::SeqCst) != WORKER_NONE {
+    while WORKER.load(Ordering::SeqCst) != WORKER_NONE
+        || HELPERS_BUSY.load(Ordering::SeqCst) != 0
+    {
         if crate::utils::tsc::rdtsc() > deadline {
-            log::warn!("model stream: stale worker (core {}) did not abort - \
-                        proceeding; its donated core may be stuck",
-                       WORKER.load(Ordering::SeqCst));
+            log::warn!("model stream: stale worker (core {}, {} helpers) did not \
+                        abort - proceeding; a donated core may be stuck",
+                       WORKER.load(Ordering::SeqCst),
+                       HELPERS_BUSY.load(Ordering::SeqCst));
             break;
         }
         core::hint::spin_loop();
@@ -298,6 +404,21 @@ pub fn begin(range: &AllocationRange, total_bytes: u64) {
     DONE.store(0, Ordering::SeqCst);
     FINISH.store(0, Ordering::SeqCst);
     WORKER.store(WORKER_NONE, Ordering::SeqCst);
+    /* Unit cursors start past the initial chunk (a 512-multiple, or
+       the whole model - div_ceil skips a partial final unit either
+       way, so nothing load_init allocated is ever re-filled). */
+    let u0 = range.1.div_ceil(512);
+    ALLOC_NEXT.store(u0, Ordering::SeqCst);
+    ALLOC_PUBLISHED.store(u0, Ordering::SeqCst);
+    SWEEP_UNIT.store(u0, Ordering::SeqCst);
+    for w in UNIT_DONE.iter() {
+        w.store(0, Ordering::SeqCst);
+    }
+    ALLOC_T0.store(0, Ordering::SeqCst);
+    /* An abandoned load's preserved hasher must not be resumed (its
+       epoch is stale anyway); the handle leaks, parity with the old
+       abort path. */
+    HASHER_LIVE.store(0, Ordering::SeqCst);
     ACTIVE.store(1, Ordering::SeqCst);
 }
 
@@ -330,20 +451,32 @@ fn grow_to(new_pages: u64) -> bool {
         return false;
     }
     let t0 = crate::utils::tsc::rdtsc();
-    let mut pt = ProcessPageTableRef::default();
-    pt.set_external_table(read_cr3().bits() as u64);
+    let pt = own_pt();
     let total = TOTAL.load(Ordering::SeqCst);
     let mut page = cur;
     while page < new_pages {
         let count = core::cmp::min(512 - (page & 0x1ff), new_pages - page) as usize;
-        if !fill_unit(&pt, page, count) {
-            ALLOC_TSC.fetch_add(crate::utils::tsc::rdtsc().wrapping_sub(t0),
-                                Ordering::SeqCst);
-            return false;
+        /* UNIT_DONE-aware: a unit a parallel filler completed (its
+           bit is set only when the WHOLE unit is filled) is skipped,
+           never re-filled - the eager fallback can take over from a
+           partially parallel load. Publication uses fetch_max so a
+           sweep-advanced watermark is never regressed. */
+        let u = page >> 9;
+        if (page & 0x1ff) == 0 && unit_done(u) {
+            page += count as u64;
+        } else {
+            if !fill_unit(&pt, page, count, true) {
+                ALLOC_TSC.fetch_add(crate::utils::tsc::rdtsc().wrapping_sub(t0),
+                                    Ordering::SeqCst);
+                return false;
+            }
+            page += count as u64;
+            if (page & 0x1ff) == 0 || page == pages_of(total) {
+                set_unit_done(u);
+            }
         }
-        page += count as u64;
-        RANGE_PAGES.store(page, Ordering::SeqCst);
-        WATERMARK.store(core::cmp::min(page * 4096, total), Ordering::SeqCst);
+        RANGE_PAGES.fetch_max(page, Ordering::SeqCst);
+        WATERMARK.fetch_max(core::cmp::min(page * 4096, total), Ordering::SeqCst);
     }
     ALLOC_TSC.fetch_add(crate::utils::tsc::rdtsc().wrapping_sub(t0), Ordering::SeqCst);
     true
@@ -381,6 +514,21 @@ pub fn update(params: &mut RequestParams) -> Result<(), MonitorError> {
            making progress. */
         if WORKER.compare_exchange(WORKER_NONE, WORKER_EAGER,
                                    Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            /* Helpers stop claiming the moment WORKER leaves the
+               donated-core range; drain the in-flight ones (bounded -
+               at most one fill_unit each) so the sequential fill
+               below cannot double-fill a unit a straggler is midway
+               through. */
+            let drain = crate::utils::tsc::rdtsc()
+                .wrapping_add(crate::utils::tsc::ticks_for_secs(5));
+            while HELPERS_BUSY.load(Ordering::SeqCst) != 0 {
+                if crate::utils::tsc::rdtsc() > drain {
+                    log::warn!("model stream: eager fallback proceeding with {} \
+                                helper(s) busy", HELPERS_BUSY.load(Ordering::SeqCst));
+                    break;
+                }
+                core::hint::spin_loop();
+            }
             let range = AllocationRange(RANGE0.load(Ordering::SeqCst),
                                         RANGE_PAGES.load(Ordering::SeqCst));
             range.mount();
@@ -398,112 +546,266 @@ pub fn update(params: &mut RequestParams) -> Result<(), MonitorError> {
 }
 
 /// One bounded quantum of worker progress; called from the donated
-/// loop's heartbeat branch every iteration. Claims the stream on
-/// first sight, keeps the range mounted on ITS OWN task PML4 across
-/// quanta (the donated core never migrates while donated), and
-/// returns between bites so LOOP_* commands stay responsive.
+/// loop's idle branch every iteration. CLAIM-OR-HELP: the first core
+/// to see the active stream claims it (the COORDINATOR - sole owner
+/// of the hasher, the completion sweep and the PTE-table skeleton);
+/// every other idle donated core HELPS by CAS-claiming published
+/// units and filling them in parallel. Each core keeps the range
+/// mounted on ITS OWN task PML4 (mounts are per-task private), keyed
+/// by MOUNT_EPOCH, and returns between bites so LOOP_* commands stay
+/// responsive.
 #[cfg(all(not(feature = "rustcrypto"), not(feature = "boottime")))]
 pub fn poll_worker(core: usize) {
-    use crate::crypto::{sha512_create, sha512_digest, sha512_update};
-
     if ACTIVE.load(Ordering::SeqCst) == 0 || FAILED.load(Ordering::SeqCst) != 0 {
+        /* Stream over/failed/cancelled: drop a claim this core still
+           holds and its slot-6 mount (helper mount hygiene after
+           finish()'s epoch bump). */
+        release_core(core);
         return;
     }
     let me = core as i64;
     let owner = WORKER.load(Ordering::SeqCst);
     if owner == WORKER_NONE {
-        let epoch = EPOCH.load(Ordering::SeqCst);
-        if WORKER.compare_exchange(WORKER_NONE, me,
-                                   Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        claim(core);
+        return;
+    }
+    if owner == me {
+        /* finish() bumps the epoch to cancel a stuck worker; a fresh
+           begin() deactivates and bumps it for an abandoned load's
+           worker. Either signal drops this claim. */
+        if EPOCH.load(Ordering::SeqCst) != WORKER_EPOCH.load(Ordering::SeqCst) {
+            log::warn!("model stream: worker aborting - stream cancelled");
+            release_core(core);
             return;
         }
-        if EPOCH.load(Ordering::SeqCst) != epoch {
+        coordinator_quantum(core);
+        return;
+    }
+    if owner >= 0 && owner < 64 {
+        helper_quantum(core);
+    }
+    /* owner == WORKER_EAGER: the guest vCPU owns the allocator role -
+       helpers idle so eager and parallel growth never interleave. */
+}
+
+/// Claim arm: become the coordinator. On a RE-claim after a graceful
+/// GPU detach (detach_core) the preserved hash state is resumed -
+/// HASHED marks the resume point.
+#[cfg(all(not(feature = "rustcrypto"), not(feature = "boottime")))]
+fn claim(core: usize) {
+    use crate::crypto::sha512_create;
+
+    let epoch = EPOCH.load(Ordering::SeqCst);
+    if WORKER.compare_exchange(WORKER_NONE, core as i64,
+                               Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return;
+    }
+    if EPOCH.load(Ordering::SeqCst) != epoch || ACTIVE.load(Ordering::SeqCst) == 0 {
+        WORKER.store(WORKER_NONE, Ordering::SeqCst);
+        return;
+    }
+    /* Preflight the WHOLE remaining need once per claim: the parallel
+       unit path bypasses grow_to and its preflight. need/512 covers
+       the PTE tables, the margin covers PMD/PUD and races. */
+    let total_pages = pages_of(TOTAL.load(Ordering::SeqCst));
+    let cur = RANGE_PAGES.load(Ordering::SeqCst);
+    if total_pages > cur {
+        let need = total_pages - cur;
+        if crate::process_manager::process_memory::pages_available()
+            < need + need / 512 + ALLOC_MARGIN_PAGES
+        {
+            log::warn!("model stream: {} pages needed, allocator low - failing the stream",
+                       need);
+            FAILED.store(1, Ordering::SeqCst);
             WORKER.store(WORKER_NONE, Ordering::SeqCst);
             return;
         }
-        let range = AllocationRange(RANGE0.load(Ordering::SeqCst),
-                                    RANGE_PAGES.load(Ordering::SeqCst));
-        range.mount();
-        WORKER_MOUNTED.store(1, Ordering::SeqCst);
-        WORKER_EPOCH.store(epoch, Ordering::SeqCst);
+        let _ = ALLOC_T0.compare_exchange(0, crate::utils::tsc::rdtsc(),
+                                          Ordering::SeqCst, Ordering::SeqCst);
+    }
+    mount_own(core, epoch);
+    WORKER_EPOCH.store(epoch, Ordering::SeqCst);
+    if HASHER_LIVE.load(Ordering::SeqCst) != 0
+        && HASHER_EPOCH.load(Ordering::SeqCst) == epoch
+    {
+        log::info!("model stream: worker on core {} resumed ({} B hashed)",
+                   core, HASHED.load(Ordering::SeqCst));
+    } else {
         WORKER_HASHER.store(unsafe { sha512_create() }, Ordering::SeqCst);
+        HASHER_EPOCH.store(epoch, Ordering::SeqCst);
+        HASHER_LIVE.store(1, Ordering::SeqCst);
         log::info!("model stream: worker on core {} claimed ({} B)",
                    core, TOTAL.load(Ordering::SeqCst));
+    }
+}
+
+/// (Re)mount the given epoch's range at this core's own slot 6.
+#[cfg(all(not(feature = "rustcrypto"), not(feature = "boottime")))]
+fn mount_own(core: usize, epoch: u64) {
+    if MOUNT_EPOCH[core].load(Ordering::SeqCst) == epoch {
         return;
     }
-    if owner != me {
-        return;
+    if MOUNT_EPOCH[core].swap(0, Ordering::SeqCst) != 0 {
+        unmount_own_slot();
     }
+    AllocationRange(RANGE0.load(Ordering::SeqCst), 0).mount();
+    MOUNT_EPOCH[core].store(epoch, Ordering::SeqCst);
+}
 
-    let abort = |msg: &str| {
-        log::warn!("model stream: worker aborting - {}", msg);
-        if WORKER_MOUNTED.swap(0, Ordering::SeqCst) != 0 {
-            AllocationRange(RANGE0.load(Ordering::SeqCst),
-                            RANGE_PAGES.load(Ordering::SeqCst)).unmount();
-        }
-        WORKER.store(WORKER_NONE, Ordering::SeqCst);
-    };
+/// One coordinator quantum: sweep completions into the watermark,
+/// publish PTE-table skeleton, then ONE bounded piece of work (a
+/// unit fill under writer pressure, else a hash bite, else the
+/// digest).
+#[cfg(all(not(feature = "rustcrypto"), not(feature = "boottime")))]
+fn coordinator_quantum(core: usize) {
+    use crate::crypto::{sha512_digest, sha512_update};
+    use crate::utils::tsc::rdtsc;
 
-    /* finish() bumps the epoch to cancel a stuck worker; a fresh
-       begin() deactivates and bumps it for an abandoned load's
-       worker. Either signal aborts this claim. */
-    if ACTIVE.load(Ordering::SeqCst) == 0
-        || EPOCH.load(Ordering::SeqCst) != WORKER_EPOCH.load(Ordering::SeqCst)
-    {
-        abort("stream cancelled");
+    /* Belt-and-braces: the exclusive loop detaches BEFORE entering
+       poll_engine; this covers a registration racing that branch. */
+    if crate::gpu::direct::engine_registered(core) {
+        detach_core(core);
         return;
     }
 
     let total = TOTAL.load(Ordering::SeqCst);
-    let written = WRITTEN.load(Ordering::SeqCst);
-    let cur_pages = RANGE_PAGES.load(Ordering::SeqCst);
+    let total_pages = pages_of(total);
+    let n_units = total_pages.div_ceil(512);
 
-    /* Allocation first: the window must outrun the writer. Grow one
-       lookahead chunk whenever the writer is within a chunk of the
-       watermark. */
-    if cur_pages * 4096 < total
-        && pages_of(written) + LOOKAHEAD_PAGES >= cur_pages
-    {
-        let target = core::cmp::min(pages_of(total), cur_pages + LOOKAHEAD_PAGES);
-        if !grow_to(target) {
-            abort("allocation shortage");
-            return;
+    /* (i) completion sweep - every quantum, cheap. The Acquire loads
+       in unit_done pair with the fillers' Release fetch_or: a unit's
+       PTE/pvalidate/zero/grant writes are ordered before the
+       watermark that exposes it (the guest POLLS the watermark via
+       update - there is no wakeup to lose). */
+    let mut sw = SWEEP_UNIT.load(Ordering::SeqCst);
+    while sw < n_units && unit_done(sw) {
+        sw += 1;
+    }
+    SWEEP_UNIT.store(sw, Ordering::SeqCst);
+    let done_pages = core::cmp::min(sw * 512, total_pages);
+    if done_pages > RANGE_PAGES.load(Ordering::SeqCst) {
+        RANGE_PAGES.fetch_max(done_pages, Ordering::SeqCst);
+        WATERMARK.fetch_max(core::cmp::min(done_pages * 4096, total),
+                            Ordering::SeqCst);
+    }
+    if sw == n_units && ALLOC_TSC.load(Ordering::SeqCst) == 0 {
+        /* Allocation complete: alloc_ms = span from the first claim
+           to the last unit's completion - the parallel fill's WALL,
+           not the summed work (the T_* buckets carry that). */
+        let t0 = ALLOC_T0.load(Ordering::SeqCst);
+        if t0 != 0 {
+            ALLOC_TSC.store(rdtsc().wrapping_sub(t0), Ordering::SeqCst);
         }
+    }
+
+    /* (ii) skeleton publish: create PTE tables ahead of the claim
+       cursor, a bounded batch per quantum. Helpers only claim BELOW
+       ALLOC_PUBLISHED, so table creation stays single-writer (and
+       F8's CAS cursor never passes it). Never done in load_init -
+       that would re-serialize the table creation into the register
+       wall (F6). */
+    let published = ALLOC_PUBLISHED.load(Ordering::SeqCst);
+    if published < n_units {
+        let goal = core::cmp::min(n_units, published + 32);
+        let pt = own_pt();
+        let t0 = rdtsc();
+        for u in published..goal {
+            ensure_pte_table(&pt, VirtAddr::from(ALLOC_VA + u * 512 * 4096), true);
+        }
+        T_TABLE_TSC.fetch_add(rdtsc().wrapping_sub(t0), Ordering::SeqCst);
+        ALLOC_PUBLISHED.store(goal, Ordering::SeqCst);
         return; // one quantum
     }
 
-    /* Hash behind the writer, one bite per quantum. HASH_TSC is the
-       PURE hash cost - the benchmarks need it separately from the
-       download it hides behind. */
+    /* (iii) one bounded piece of work. Writer pressure or an idle
+       hasher -> pull a unit ourselves (same CAS protocol as the
+       helpers); otherwise hash - helpers keep the cursor moving. */
+    let written = WRITTEN.load(Ordering::SeqCst);
     let hashed = HASHED.load(Ordering::SeqCst);
-    let limit = core::cmp::min(written, RANGE_PAGES.load(Ordering::SeqCst) * 4096);
-    if hashed < limit {
-        let len = core::cmp::min(HASH_BITE, limit - hashed) as u32;
-        let t0 = crate::utils::tsc::rdtsc();
+    let hash_limit = core::cmp::min(written,
+                                    RANGE_PAGES.load(Ordering::SeqCst) * 4096);
+    let units_left = ALLOC_NEXT.load(Ordering::SeqCst) < n_units;
+    let hash_ready = hashed < hash_limit;
+    let pressure = WATERMARK.load(Ordering::SeqCst)
+        < core::cmp::min(written + LOOKAHEAD_PAGES * 4096, total);
+    if units_left && (pressure || !hash_ready) {
+        claim_and_fill_one_unit();
+        return;
+    }
+    if hash_ready {
+        let len = core::cmp::min(HASH_BITE, hash_limit - hashed) as u32;
+        let t0 = rdtsc();
         unsafe {
-            sha512_update((0x30000000000u64 + hashed) as *mut u8, len,
+            sha512_update((ALLOC_VA + hashed) as *mut u8, len,
                           WORKER_HASHER.load(Ordering::SeqCst));
         }
-        HASH_TSC.fetch_add(crate::utils::tsc::rdtsc().wrapping_sub(t0),
-                           Ordering::SeqCst);
+        HASH_TSC.fetch_add(rdtsc().wrapping_sub(t0), Ordering::SeqCst);
         HASHED.store(hashed + len as u64, Ordering::SeqCst);
         return;
     }
-
     if FINISH.load(Ordering::SeqCst) != 0 && hashed == total {
-        let t0 = crate::utils::tsc::rdtsc();
+        let t0 = rdtsc();
+        /* sha512_digest frees the hacl state - kill the resume flag
+           BEFORE the claim release could let anyone resume it. */
+        HASHER_LIVE.store(0, Ordering::SeqCst);
         unsafe {
-            sha512_digest(DIGEST.as_mut_ptr(), WORKER_HASHER.load(Ordering::SeqCst));
+            sha512_digest(DIGEST.as_mut_ptr(),
+                          WORKER_HASHER.load(Ordering::SeqCst));
         }
-        HASH_TSC.fetch_add(crate::utils::tsc::rdtsc().wrapping_sub(t0),
-                           Ordering::SeqCst);
-        if WORKER_MOUNTED.swap(0, Ordering::SeqCst) != 0 {
-            AllocationRange(RANGE0.load(Ordering::SeqCst),
-                            RANGE_PAGES.load(Ordering::SeqCst)).unmount();
+        HASH_TSC.fetch_add(rdtsc().wrapping_sub(t0), Ordering::SeqCst);
+        if MOUNT_EPOCH[core].swap(0, Ordering::SeqCst) != 0 {
+            unmount_own_slot();
         }
         DONE.store(1, Ordering::Release);
         WORKER.store(WORKER_NONE, Ordering::SeqCst);
         // The core returns to its idle loop - back to sleep.
+    }
+}
+
+/// Helper quantum: idle donated cores (not the claim owner) pull
+/// published units in parallel with the coordinator. HELPERS_BUSY is
+/// announced FIRST and the gates re-checked after, so the drains in
+/// begin()/finish()/the eager arm never miss an in-flight fill.
+#[cfg(all(not(feature = "rustcrypto"), not(feature = "boottime")))]
+fn helper_quantum(core: usize) {
+    HELPERS_BUSY.fetch_add(1, Ordering::SeqCst);
+    let owner = WORKER.load(Ordering::SeqCst);
+    let epoch = EPOCH.load(Ordering::SeqCst);
+    if ACTIVE.load(Ordering::SeqCst) != 0
+        && FAILED.load(Ordering::SeqCst) == 0
+        && owner >= 0 && owner < 64 && owner != core as i64
+        && epoch == WORKER_EPOCH.load(Ordering::SeqCst)
+    {
+        mount_own(core, epoch);
+        claim_and_fill_one_unit();
+    }
+    HELPERS_BUSY.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// CAS-claim the next published unit and fill it through this task's
+/// own mount. Shared by coordinator pulls and helpers - one code
+/// path, one failure behavior (fill_unit sets FAILED and the claimed
+/// index is abandoned: FAILED ends the stream for everyone).
+#[cfg(all(not(feature = "rustcrypto"), not(feature = "boottime")))]
+fn claim_and_fill_one_unit() {
+    let published = ALLOC_PUBLISHED.load(Ordering::SeqCst);
+    loop {
+        let u = ALLOC_NEXT.load(Ordering::SeqCst);
+        if u >= published {
+            return;
+        }
+        if ALLOC_NEXT.compare_exchange(u, u + 1, Ordering::SeqCst,
+                                       Ordering::SeqCst).is_err() {
+            continue;
+        }
+        let total_pages = pages_of(TOTAL.load(Ordering::SeqCst));
+        let start = u * 512;
+        let count = core::cmp::min(512, total_pages - start) as usize;
+        let pt = own_pt();
+        if fill_unit(&pt, start, count, false) {
+            set_unit_done(u);
+        }
+        return;
     }
 }
 
@@ -551,6 +853,20 @@ pub fn finish() -> Option<[u8; 64]> {
     };
     ACTIVE.store(0, Ordering::SeqCst);
     EPOCH.fetch_add(1, Ordering::SeqCst);
+    /* Helpers observe the bump/deactivation at their next gate check
+       and never start a new unit; drain the in-flight ones (bounded -
+       at most one fill_unit each) before the caller mounts the range
+       for the synchronous fallback, revokes write access, or a later
+       delete() tears the subtree down under a straggler. */
+    let drain = rdtsc().wrapping_add(ticks_for_secs(5));
+    while HELPERS_BUSY.load(Ordering::SeqCst) != 0 {
+        if rdtsc() > drain {
+            log::warn!("model stream: {} helper(s) still busy 5 s after finish - \
+                        proceeding", HELPERS_BUSY.load(Ordering::SeqCst));
+            break;
+        }
+        core::hint::spin_loop();
+    }
     let ms = |tsc: u64| tsc / (TSC_HZ / 1000);
     log::info!("model measure: {} B hash_ms={} alloc_ms={} wall_ms={} streamed={} \
                 alloc_lock_ms={} alloc_pte_ms={} alloc_pval_ms={} alloc_zero_ms={} \

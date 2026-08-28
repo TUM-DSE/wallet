@@ -96,6 +96,14 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         // client is replaced by the next one's registration without
         // any reboot.
         if crate::gpu::direct::engine_registered(id) {
+            /* Hand a claimed stream worker off BEFORE blocking for the
+               whole GPU session: the hash state is preserved for the
+               next claimer (stream::detach_core), and with no free
+               donated core left the guest's eager fallback fires.
+               Without this the claimed-but-starved worker kept
+               STATE_CLAIMED set and the guest writer spun on the
+               watermark forever. Also drops a stale helper mount. */
+            crate::model_store::stream::detach_core(id);
             log::warn!("Donated core {}: polling GPU engine page", id);
             /* No deadline: donated cores are offline in the guest, so
                there is nothing to yield to (and no IPI hazard). */
@@ -114,13 +122,14 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         // engine-registered case runs the same scan inside
         // poll_engine's idle branch). Rate-limited inside.
         crate::process_runtime::log_overbudget_invokes(id, -1);
-        // Streaming model load: one bounded quantum (allocate ahead of
-        // the writer / hash behind it) per iteration, so LOOP_*
-        // commands stay responsive between bites. No-op when no load
-        // is in flight; the core "goes back to sleep" (this idle loop)
-        // when the digest is finalized. Note: a core whose engine
-        // registers mid-load stops polling here - the guest's eager
-        // fallback and fin's legacy measure keep the load correct.
+        // Streaming model load: one bounded quantum (claim-or-help:
+        // coordinate the hash/sweep or fill units in parallel) per
+        // iteration, so LOOP_* commands stay responsive between
+        // bites. No-op when no load is in flight; the core "goes back
+        // to sleep" (this idle loop) when the digest is finalized. A
+        // core whose engine registers mid-load detaches gracefully
+        // above - another donated core resumes the preserved hash, or
+        // the guest's eager fallback covers the allocation.
         crate::model_store::stream::poll_worker(id);
     }
 
