@@ -101,6 +101,17 @@ impl ProcessRuntimeGpu for PALContext {
         self.process.gpu_core = core as i64;
         log::warn!("gpu_channel: comm page {:#x?} mapped at {:#x}, polled by core {}",
                    page, addr, core);
+        if !crate::gpu::direct::service_registered(core) {
+            /* Every relayed call will answer 802 and llama falls back
+               to CPU inference SILENTLY (observed: init 6 s instead of
+               13 s, tokens/s ~10x off) - make the poisoned session
+               unmissable in the log. Happens after a dropped
+               registration (relay timeout / slow session_reset): the
+               service never re-registers, restart it. */
+            log::error!("gpu_channel: NO SERVICE registered for engine {} - \
+                         this session will run WITHOUT the GPU (CPU \
+                         fallback); restart the engine's service", core);
+        }
 
         /* Approach B: if the service registered a staging window for
            this engine, grant the trustlet VMPL1|RW on its pages and map

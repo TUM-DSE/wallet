@@ -10,6 +10,64 @@ pub trait ProcessRuntimeException {
     fn handle_df(&mut self) -> ReturnTarget;
 }
 
+impl PALContext {
+    /// A real #PF/#GP always pushes a hardware error code (a small
+    /// value: PF bits 0-15, GP selector index <= 0xffff). Sporadically
+    /// the trustlet's vector-13/14 entry runs WITHOUT one - an event
+    /// injected from outside the trustlet with no error code (the
+    /// guest kernel's interrupt landing while the vCPU is at VMPL1;
+    /// captured 2026-08-28: frame is [RIP, CS, RFLAGS, RSP, SS], so
+    /// the entry asm's "error code" load reads the interrupted RIP,
+    /// and its `addq $8` on return would drop the RIP and iretq into
+    /// garbage). Detect that shape, emulate the return the asm cannot
+    /// do, and swallow the event. Before this, every such phantom
+    /// killed the session (~2/10 recycled inits) - and until the dump
+    /// clamp, panicked the SVSM.
+    ///
+    /// Returns true when a phantom frame was detected and fixed up.
+    fn try_fixup_phantom_exception(&mut self, vector: u64) -> bool {
+        let err = self.vmsa.rbx;
+        if err <= 0xFFFF {
+            return false; // plausible hardware error code: a real fault
+        }
+        let rsp = self.vmsa.rsp;
+        let mut pt = ProcessPageTableRef::default();
+        pt.set_external_table(self.vmsa.cr3);
+        /* No-error-code frame after the entry's three pushes:
+           +0 rbx, +8 rax, +16 rcx, +24 RIP, +32 CS, +40 RFLAGS,
+           +48 RSP, +56 SS. Read per-qword: the frame may cross a
+           page (the dump-clamp lesson). */
+        let mut q = [0u64; 8];
+        for (i, slot) in q.iter_mut().enumerate() {
+            let va = rsp + (i as u64) * 8;
+            let page = pt.get_page(VirtAddr::from(va & !0xFFF));
+            if page == PhysAddr::null() {
+                return false;
+            }
+            let (_m, mapping) = map_paddr!(page);
+            *slot = unsafe {
+                mapping.as_ptr::<u64>().add(((va & 0xFFF) / 8) as usize).read()
+            };
+        }
+        /* The frame must carry the trustlet's user selectors exactly
+           where the no-error-code layout puts them - otherwise fall
+           through to the kill path rather than resume into garbage. */
+        if q[4] != 0x1b || q[7] != 0x23 {
+            return false;
+        }
+        log::warn!("[Trustlet] phantom vector-{} event (no error code, \
+                    'error' {:#x}) at rip {:#x} - swallowed and resumed",
+                   vector, err, q[3]);
+        self.vmsa.rbx = q[0];
+        self.vmsa.rax = q[1];
+        self.vmsa.rcx = q[2];
+        self.vmsa.rip = q[3];
+        self.vmsa.rflags = q[5];
+        self.vmsa.rsp = q[6];
+        true
+    }
+}
+
 impl ProcessRuntimeException for PALContext {
     /// Handle an exception occured in the trustlet
     // XXX: Currently this function assumes that the exception is a #PF
@@ -17,6 +75,9 @@ impl ProcessRuntimeException for PALContext {
         let exception = self.vmsa.rcx;
         match exception {
             13 => {
+                if self.try_fixup_phantom_exception(13) {
+                    return RETURN_TO_PROCESS;
+                }
                 let cr2 = self.vmsa.cr2;
                 let error_code = self.vmsa.rbx;
                 let rsp = self.vmsa.rsp;
@@ -75,6 +136,9 @@ impl ProcessRuntimeException for PALContext {
                 #[cfg(feature = "stat")]
                 crate::sev::utils::stat::PF_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
 
+                if self.try_fixup_phantom_exception(14) {
+                    return RETURN_TO_PROCESS;
+                }
                 let rip= self.vmsa.rip;
                 let cr2 = self.vmsa.cr2;
                 let error_code = self.vmsa.rbx;

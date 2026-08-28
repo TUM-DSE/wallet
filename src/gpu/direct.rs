@@ -536,6 +536,14 @@ pub fn engine_registered(core: usize) -> bool {
     core < 64 && unsafe { ENGINE_PAGES[core] } != PhysAddr::null()
 }
 
+/// True when a service (per-engine or legacy) would answer relays for
+/// `core`. A session created without one runs its CUDA calls into the
+/// 802 arm and llama silently falls back to CPU inference - poisonous
+/// for benchmarks, so gpu_channel warns loudly on this.
+pub fn service_registered(core: usize) -> bool {
+    service_page_for(core) != PhysAddr::null()
+}
+
 /// Register a monitor-provisioned comm page (trustlet GPU channel) in
 /// `core`'s engine slot — same slot and polling as a guest client's
 /// page registered via register_engine.
@@ -638,8 +646,18 @@ pub fn poll_engine(core: usize,
                     if forward_call_bounded(svc, 500, DEFERRED_STOP_TIMEOUT_SECS) {
                         log::info!("deferred stop acked by service (core {})", core);
                     } else {
-                        log::warn!("deferred stop: no ack (core {}) - service \
-                                    presumed gone", core);
+                        /* Exited (exit-on-stop) or resetting slower
+                           than the bound (observed 245.7 s with the
+                           default MEMLOCK limit - run services with
+                           LimitMEMLOCK=infinity / ulimit -l unlimited
+                           like the e2e unit). Drop the registration
+                           NOW: the next session's calls then fail
+                           fast and loud (802) instead of stalling
+                           another full bound each and silently
+                           falling back to CPU inference. */
+                        log::warn!("deferred stop: no ack (core {}) - dropping \
+                                    the service registration", core);
+                        drop_service(core);
                     }
                 }
             }
@@ -739,7 +757,7 @@ pub fn poll_engine(core: usize,
             match service {
                 Some(service) => {
                     service.data[..req_len].copy_from_slice(&args.data[..req_len]);
-                    if !forward_call(service, call_id) {
+                    if !forward_call_bounded(service, call_id, slow_call_bound(call_id)) {
                         /* Fail this call back to the client and drop
                            the dead service, rather than spinning here
                            forever with the CPU (and, on the legacy
@@ -1186,6 +1204,25 @@ const FORWARD_TIMEOUT_SECS: u64 = 30;
 /// because the ack only comes after the reset. See the deferred-stop
 /// branch in poll_engine for why this is one attempt, never retried.
 const DEFERRED_STOP_TIMEOUT_SECS: u64 = 120;
+
+/// Longer bound for calls the CC-mode driver is KNOWN to stall on for
+/// tens of seconds (the os_alloc_mem family, stream/module setup):
+/// observed cudaStreamCreateWithFlags (38) blowing the 30 s bound
+/// mid-init, killing an otherwise healthy session (802 -> llama
+/// abort). The default stays 30 s so a dead service is still detected
+/// fast on the hot path (memcpy/launch/sync).
+const SLOW_CALL_TIMEOUT_SECS: u64 = 120;
+
+fn slow_call_bound(call_id: u32) -> u64 {
+    match call_id {
+        // stream create/destroy, malloc/free family (device + host)
+        37 | 38 | 47 | 93 | 94 | 97 | 98 | 101 => SLOW_CALL_TIMEOUT_SECS,
+        // fatbin transfer + kernel registration (module load JITs) and
+        // cuBLAS handle creation - all one-per-session setup calls
+        501..=504 | 600 => SLOW_CALL_TIMEOUT_SECS,
+        _ => FORWARD_TIMEOUT_SECS,
+    }
+}
 
 /// Relay one call to the service. Returns false if the service did not
 /// answer in time.
