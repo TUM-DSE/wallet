@@ -18,12 +18,16 @@
 /// [0, written) - the hashed prefix and the granted tail are stable.
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-use crate::address::{Address, VirtAddr};
+use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::process_manager::allocation::AllocationRange;
-use crate::process_manager::process_paging::ProcessPageTableRef;
+use crate::process_manager::process_paging::{ProcessPageFlags, ProcessPageTableEntry,
+                                             ProcessPageTablePage, ProcessPageTableRef};
+use crate::process_manager::memory_helper::strip_c_bit;
+use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::interop::memory::read_cr3;
 use crate::sev::{rmp_adjust, RMPFlags};
 use crate::types::PageSize;
+use crate::{map_paddr, paddr_as_table, strip_paddr};
 use crate::{MonitorError, RequestParams};
 
 /// Guest request flag (rdx): allocate the rest synchronously on the
@@ -82,6 +86,47 @@ static WORKER_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 fn pages_of(bytes: u64) -> u64 {
     bytes.div_ceil(4096)
+}
+
+/// Grant the GUEST (VMPL2) access to the page-TABLE pages covering
+/// data pages [from_page, to_page) of the range's subtree. inflate()
+/// allocates new PMD/PTE table pages with only the VMPL1 grant the
+/// channel paths need - but the guest's hardware walker must READ
+/// them (and write A/D bits), or the first touch of a grown page
+/// nested-faults forever (found on hardware: register hung in a
+/// silent, killable fault loop on byte one past the initial chunk).
+/// Mirrors guest_write_access()'s table pass, bounded to the chunk:
+/// one PTE page per 2 MB + one PMD page per 1 GB + the PUD page.
+fn grant_tables_for(range0: u64, from_page: u64, to_page: u64) {
+    let pgd_entry = ProcessPageTableEntry(PhysAddr::from(range0));
+    let (m1, pud_table) = paddr_as_table!(strip_paddr!(pgd_entry.0));
+    let _ = rmp_adjust(m1.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX,
+                       PageSize::Regular);
+    let pud_from = (from_page >> 18) as usize; // 512*512 pages per PUD entry
+    let pud_to = ((to_page - 1) >> 18) as usize;
+    for pi in pud_from..=pud_to {
+        let pud_entry = pud_table[pi];
+        if !pud_entry.flags().contains(ProcessPageFlags::PRESENT) {
+            continue;
+        }
+        let (m2, pmd_table) = paddr_as_table!(strip_paddr!(pud_entry.0));
+        let _ = rmp_adjust(m2.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX,
+                           PageSize::Regular);
+        let base = (pi as u64) << 18;
+        let lo = core::cmp::max(from_page, base);
+        let hi = core::cmp::min(to_page, base + (1 << 18));
+        let pmd_from = ((lo - base) >> 9) as usize;
+        let pmd_to = ((hi - 1 - base) >> 9) as usize;
+        for mi in pmd_from..=pmd_to {
+            let pmd_entry = pmd_table[mi];
+            if !pmd_entry.flags().contains(ProcessPageFlags::PRESENT) {
+                continue;
+            }
+            let (m3, _pte_table) = paddr_as_table!(strip_paddr!(pmd_entry.0));
+            let _ = rmp_adjust(m3.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX,
+                               PageSize::Regular);
+        }
+    }
 }
 
 /// Arm the stream. Called from load_init on the loading vCPU, after
@@ -146,8 +191,11 @@ fn grow_to(new_pages: u64) -> bool {
     let mut pt = ProcessPageTableRef::default();
     pt.set_external_table(read_cr3().bits() as u64);
     range.inflate(&mut pt, new_pages, 0x30000000000u64);
-    /* The VMPL2 write grant inflate() does not do - tail pages only,
-       via the mounted VA (the data-page half of guest_write_access). */
+    /* The VMPL2 grants inflate() does not do: the NEW table pages
+       (the guest's walker must read them - without this the first
+       touch of a grown page fault-loops), then the tail data pages
+       via the mounted VA (the data half of guest_write_access). */
+    grant_tables_for(range.0, cur, new_pages);
     for i in cur..new_pages {
         let _ = rmp_adjust(VirtAddr::from(0x30000000000u64 + i * 4096),
                            RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
