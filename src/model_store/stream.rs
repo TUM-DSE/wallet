@@ -600,7 +600,16 @@ fn claim(core: usize) {
                                Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
     }
-    if EPOCH.load(Ordering::SeqCst) != epoch || ACTIVE.load(Ordering::SeqCst) == 0 {
+    /* DONE: the digest is published and finish() is tearing the
+       stream down - the worker released BEFORE ACTIVE clears, so an
+       idle core could otherwise re-claim the finished stream for a
+       few quanta (visible as a spurious claim between the measure
+       line and load_fin's store-entry print; DONE's release-store
+       precedes the WORKER release, so this check is deterministic
+       for any successful CAS). */
+    if EPOCH.load(Ordering::SeqCst) != epoch || ACTIVE.load(Ordering::SeqCst) == 0
+        || DONE.load(Ordering::SeqCst) != 0
+    {
         WORKER.store(WORKER_NONE, Ordering::SeqCst);
         return;
     }
