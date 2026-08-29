@@ -108,9 +108,13 @@ impl TrustedProcess {
         manifest_range.delete();
         log::debug!("TODO: Compare with manifest measurement of the policy");
 
+        breakdown_outb(230);
         let (libos_data, libos_range) = ProcessPageTableRef::copy_data_from_guest(libos, libos_size, pgt);
+        breakdown_outb(231);
         log::debug!("libos_range {:?}", libos_range);
+        breakdown_outb(232);
         base.add_libos(libos_data, libos_size, libos_range);
+        breakdown_outb(233);
         breakdown_outb(198);
         measurements.libos_measurement = measure(libos_data.into(), libos_size);
         breakdown_outb(199);
@@ -237,7 +241,9 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
 
             log::debug!("Get ID back from store {res}");
             let z = PROCESS_STORE.get(ProcessID(res.try_into().unwrap()));
+            breakdown_outb(234);
             early_invoke(z);
+            breakdown_outb(235);
 
 
             // Copy the value to the return register
