@@ -51,7 +51,11 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     log::debug!("Invoking Trustlet");
 
-    let id = params.rcx;
+    /* Bit 63 of rcx marks a vmpl.ko RE-ENTRY after a CONTINUE yield
+       (see TrustletReturnType::CONTINUE): resume the parked VMPL1
+       context without re-running the invocation-type setup. */
+    let reentry = params.rcx & (1u64 << 63) != 0;
+    let id = params.rcx & !(1u64 << 63);
 
     /* Refuse to resume anything that cannot be resumed - out-of-range
        or unoccupied ids (the id comes from the guest; get() would
@@ -163,8 +167,12 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
     let sev_features = trustlet.context.sev_features;
 
     let apic_id = crate::exclusive::get_apic_id();
+    let prev_start = trustlet.invoke_start_tsc;
     breakdown_outb(212);
-    match invocation_type {
+    /* A CONTINUE re-entry skips the setup entirely - the guest page
+       still says NORMAL, but channels/args/measurement were done on
+       the first slice; redoing them would re-inflate and re-hash. */
+    if !reentry { match invocation_type {
         TrustletInvocationType::NORMAL => {
             // log::info!("Invoking Trustlet: Normal");
             trustlet.context.channel.inflate_input(vmsa.cr3, function_arg_size as usize);
@@ -268,6 +276,8 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
 
     }
 
+    }
+
     let mut rc = PALContext{
             process: trustlet,
             vmsa,
@@ -303,7 +313,13 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
        donated poller's log_overbudget_invokes covers that family with
        detection only. One rdtsc per handled request is noise. */
     let budget = crate::utils::tsc::ticks_for_secs(super::INVOKE_BUDGET_SECS);
-    let start = crate::utils::tsc::rdtsc();
+    /* Seed from the first slice on re-entry: the watchdog budget is
+       per-INVOKE, not per-slice (yields would otherwise reset it). */
+    let start = if reentry && prev_start != 0 {
+        prev_start
+    } else {
+        crate::utils::tsc::rdtsc()
+    };
     rc.process.invoke_owner_apic = apic_id;
     rc.process.invoke_start_tsc = start;
     rc.process.running = true;
@@ -326,9 +342,13 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
             break;
         }
     }
+    let yielded = unsafe { *rc.return_values.rcx }
+        == super::TrustletReturnType::CONTINUE as u64;
     rc.process.running = false;
-    rc.process.invoke_start_tsc = 0;
-    rc.process.invoke_owner_apic = u32::MAX;
+    if !yielded {
+        rc.process.invoke_start_tsc = 0;
+        rc.process.invoke_owner_apic = u32::MAX;
+    }
     //params.rcx = rc.return_value;
     INVOKES_IN_FLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
     breakdown_outb(214);

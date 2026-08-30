@@ -9,6 +9,11 @@ use core::sync::atomic::{self, AtomicU64};
 /// CoW faults handled across all trustlets (see the CoW arm below).
 static COW_FAULTS: AtomicU64 = AtomicU64::new(0);
 
+/// Phantom guest interrupts converted into CONTINUE yields (the
+/// invoke-stall fix): each one is an interrupt the vCPU would have
+/// swallowed unacked - the fingerprint of the TLB-shootdown stalls.
+static PHANTOM_YIELDS: AtomicU64 = AtomicU64::new(0);
+
 pub trait ProcessRuntimeException {
     fn handle_exception(&mut self) -> ReturnTarget;
     fn handle_df(&mut self) -> ReturnTarget;
@@ -72,6 +77,24 @@ impl PALContext {
     }
 }
 
+impl PALContext {
+    /// After a phantom fixup: the interrupted RIP is restored in the
+    /// VMSA, so returning to the guest resumes exactly where the
+    /// interrupt hit. Yield (CONTINUE) so the vCPU services the
+    /// pending interrupt in ioctl context - vmpl.ko re-enters
+    /// immediately. Nested calls have no guest to return to: keep
+    /// the old swallow-and-resume there.
+    fn phantom_yield_or_resume(&mut self) -> ReturnTarget {
+        if self.nested_call {
+            return RETURN_TO_PROCESS;
+        }
+        PHANTOM_YIELDS.fetch_add(1, atomic::Ordering::Relaxed);
+        self.return_values.result(
+            crate::process_runtime::TrustletReturnType::CONTINUE as u64);
+        RETURN_TO_GUEST
+    }
+}
+
 impl ProcessRuntimeException for PALContext {
     /// Handle an exception occured in the trustlet
     // XXX: Currently this function assumes that the exception is a #PF
@@ -80,7 +103,7 @@ impl ProcessRuntimeException for PALContext {
         match exception {
             13 => {
                 if self.try_fixup_phantom_exception(13) {
-                    return RETURN_TO_PROCESS;
+                    return self.phantom_yield_or_resume();
                 }
                 let cr2 = self.vmsa.cr2;
                 let error_code = self.vmsa.rbx;
@@ -141,7 +164,7 @@ impl ProcessRuntimeException for PALContext {
                 crate::sev::utils::stat::PF_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
 
                 if self.try_fixup_phantom_exception(14) {
-                    return RETURN_TO_PROCESS;
+                    return self.phantom_yield_or_resume();
                 }
                 let _rip = self.vmsa.rip;
                 let cr2 = self.vmsa.cr2;

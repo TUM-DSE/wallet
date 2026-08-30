@@ -159,6 +159,11 @@ enum TrustletReturnType {
     OPEN=4,
     READ=5,
     MMAP=6,
+    /// Guest interrupt landed at VMPL1 (phantom vector-13/14 event) -
+    /// return to ioctl context so the vCPU services/acks it (TLB
+    /// shootdown IPIs!), then vmpl.ko re-enters immediately. Never
+    /// surfaces to userspace: the kernel loop consumes it.
+    CONTINUE=7,
     INFERENCEREGISTER=12,
     INFERENCE=13
 }
