@@ -323,11 +323,28 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
     rc.process.invoke_owner_apic = apic_id;
     rc.process.invoke_start_tsc = start;
     rc.process.running = true;
+    /* Deadline yield (mechanism 2 of the lukewarm-stall fix): even
+       with phantom events converted to yields, stalls persisted -
+       the guest's IPIs are apparently never injected into VMPL1, so
+       there is nothing to trigger on. Bound VMPL residency instead:
+       after each slice, return CONTINUE so the vCPU services pending
+       interrupts in ioctl context; vmpl.ko re-enters immediately.
+       Checked only between process calls (relay spins produce no
+       exits - a shootdown ack is then delayed at most one relay
+       call, which is what breaks the stall cycle). */
+    let slice = crate::utils::tsc::ticks_for_micros(10_000);
+    let mut slice_start = crate::utils::tsc::rdtsc();
     loop {
         switch_to_vmpl(TRUSTLET_VMPL);
         let cont = rc.handle_process_request();
         rc.process.in_pcall = false;
         if !cont {
+            break;
+        }
+        let now = crate::utils::tsc::rdtsc();
+        if now.wrapping_sub(slice_start) > slice {
+            slice_start = now;
+            rc.return_values.result(super::TrustletReturnType::CONTINUE as u64);
             break;
         }
         if crate::utils::tsc::rdtsc().wrapping_sub(start) > budget {
