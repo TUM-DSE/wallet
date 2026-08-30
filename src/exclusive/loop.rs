@@ -95,7 +95,8 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         // re-reads the registration every iteration, so a crashed
         // client is replaced by the next one's registration without
         // any reboot.
-        if crate::gpu::direct::engine_registered(id) {
+        if crate::gpu::direct::engine_registered(id)
+            || crate::gpu::direct::engine_slot_owes_stop(id) {
             /* Hand a claimed stream worker off BEFORE blocking for the
                whole GPU session: the hash state is preserved for the
                next claimer (stream::detach_core), and with no free
