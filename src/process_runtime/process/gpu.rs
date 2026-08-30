@@ -90,11 +90,6 @@ impl ProcessRuntimeGpu for PALContext {
             | ProcessPageFlags::NO_EXECUTE;
         page_table_ref.map_4k_page(VirtAddr::from(addr), page, flags);
 
-        /* The trustlet's own page table goes with the registration: the
-           bulk memcpy path translates client source addresses itself
-           rather than having the payload copied through the comm page. */
-        crate::gpu::direct::register_engine_page(
-            core, page, PhysAddr::from(self.vmsa.cr3));
         /* Remember the slot so death (exit/fault) can free it - a dead
            session's registration otherwise squats on the donated core
            until another session replaces it. */
@@ -170,6 +165,18 @@ impl ProcessRuntimeGpu for PALContext {
             log::warn!("gpu_channel: shared heap mapped at {:#x} ({} KiB)",
                        crate::gpu::direct::GPU_HEAP_VADDR, self.vmsa.rbx >> 10);
         }
+
+        /* Publish the comm page LAST - after IS_TRUSTLET/HEAP_MAPPED
+           (map_heap_for_trustlet) and the page table are in place.
+           The old order registered first, so the poller could start
+           relaying (and take the HEAP_GROW trustlet branch) against
+           incomplete slot metadata. The trustlet only touches the
+           page after this call returns, so nothing is delayed. The
+           bulk memcpy path translates client source addresses itself
+           rather than having the payload copied through the comm
+           page - hence the page table travels with the registration. */
+        crate::gpu::direct::register_engine_page(
+            core, page, PhysAddr::from(self.vmsa.cr3));
 
         /* Phase-0 instrumentation: state of the monitor-managed PML4
            slots after everything gpu_channel just mapped. */
