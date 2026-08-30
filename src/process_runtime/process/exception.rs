@@ -4,6 +4,10 @@ use crate::{address::{PhysAddr, VirtAddr}, map_paddr, process_manager::process_p
 use crate::memory::paging::PerCPUPageMappingGuard;
 
 use super::super::TrustletReturnType;
+use core::sync::atomic::{self, AtomicU64};
+
+/// CoW faults handled across all trustlets (see the CoW arm below).
+static COW_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 pub trait ProcessRuntimeException {
     fn handle_exception(&mut self) -> ReturnTarget;
@@ -139,7 +143,7 @@ impl ProcessRuntimeException for PALContext {
                 if self.try_fixup_phantom_exception(14) {
                     return RETURN_TO_PROCESS;
                 }
-                let rip= self.vmsa.rip;
+                let _rip = self.vmsa.rip;
                 let cr2 = self.vmsa.cr2;
                 let error_code = self.vmsa.rbx;
                 const PF_PRESENT: u64 = 1 << 0;
@@ -148,7 +152,6 @@ impl ProcessRuntimeException for PALContext {
                 const PF_RESERVED: u64 = 1 << 3;
                 const PF_INSTRUCTION: u64 = 1 << 4;
                 let mmap_manager = &self.process.mmap_manager;
-                log::trace!("[Trustlet] #PF: CR2=0x{:x}", cr2);
                 if let Some(mmap_info) = mmap_manager.lookup(cr2 as usize) {
                     log::trace!("Found file mapping: mmap_info={:?}", mmap_info);
                     if error_code & PF_PRESENT == 0 {
@@ -183,8 +186,6 @@ impl ProcessRuntimeException for PALContext {
                     } else {
                         log::trace!("[Trustlet] #PF on present mmaped-page");
                     }
-                } else {
-                    log::trace!("[Trustlet] #PF: address is not mmaped-page");
                 }
                 if error_code & PF_PRESENT != 0 && error_code & PF_WRITE != 0 {
                     // CoW
@@ -193,12 +194,18 @@ impl ProcessRuntimeException for PALContext {
 
                     let mut page_table_ref = ProcessPageTableRef::default();
                     page_table_ref.set_external_table(self.vmsa.cr3);
-                    // Handle CoW
-                    log::trace!("[Trustlet] CoW: RIP={:#x}, CR2={:#x}, Error code={:?}", rip, cr2, error_code);
+                    /* The global console filter is Trace and the UART is
+                       FIFO-less (>=2 port exits per byte), so the old 4
+                       trace lines here cost real time on every CoW fault
+                       (836 faults in one llama trustlet init). A counter
+                       with a rare summary keeps the signal. */
+                    let n = COW_FAULTS.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+                    if n % 4096 == 0 {
+                        log::debug!("[Trustlet] CoW: {} faults handled", n);
+                    }
                     let user_access = error_code & PF_USER != 0;
                     let handled = page_table_ref.handle_cow(VirtAddr::from(cr2), user_access);
                     if handled {
-                        log::trace!("[Trustlet] CoW: handled");
                         return RETURN_TO_PROCESS;
                     }
                     log::info!("[Trustlet] [BUG] CoW: not handled");
