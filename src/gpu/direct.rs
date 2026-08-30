@@ -952,8 +952,20 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
         let args_len =
             u32::from_le_bytes(data[48..52].try_into().unwrap()) as usize;
         Some((LAUNCH_HDR + args_len.min(LAUNCH_MAX_ARGS), 4))
+    } else if id == 501 {
+        // fatbin init: u64 total size in; i32 err back
+        Some((8, 4))
+    } else if id == 502 {
+        // fatbin chunk: u32 len @0 + payload @8 in; i32 err back. The
+        // old full-page response echoed ~171 MB of dead bytes over a
+        // llama registration (42k chunks x 4088).
+        let chunk = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        Some(((8 + chunk).min(COMM_DATA_SIZE), 4))
+    } else if id == 503 {
+        // fatbin end: no request payload; i32 err + u32 module id back
+        Some((4, 8))
     } else if id >= CTRL_FIRST && id <= CTRL_LAST {
-        // registration control messages: full data-area relay both ways
+        // kernel registration (504): variable name in, param table out
         Some((COMM_DATA_SIZE, COMM_DATA_SIZE))
     } else if id == C::CUDA_API_CALL_cudaGetDeviceProperties_v2.0 {
         // req: i32 device; resp: i32 err @0, cudaDeviceProp @8 —
