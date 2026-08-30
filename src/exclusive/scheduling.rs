@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 use core::arch::asm;
-use crate::exclusive::{ControlStruct, VMSA_FEAT, VMSA_PHYS, CONTROL};
+use crate::exclusive::{ControlStruct, VMSA_FEAT, VMSA_PHYS};
 use crate::address::{Address, PhysAddr};
 use crate::memory::paging::PerCPUPageMappingGuard;
 use crate::{MonitorError, RequestParams};
@@ -19,19 +19,17 @@ pub fn sleep(ctr: &mut ControlStruct) {
 }
 
 pub fn wakeup(id: usize) -> u64 {
-    let (vmsa_pa, features) = unsafe {
-        (VMSA_PHYS[id], VMSA_FEAT[id])
-    };
-    if vmsa_pa.is_null() {
-        log::warn!("Not running in exclusive mode");
-        return 1;
-    }
-
-    let ctr_page: PhysAddr = unsafe {
-        CONTROL[id]
-    };
+    /* gate first: a non-null CONTROL (Acquire) guarantees the VMSA
+       pair published before it is visible */
+    let ctr_page = super::control_page(id);
     if ctr_page.is_null() {
         log::warn!("Control area missing");
+        return 1;
+    }
+    let vmsa_pa = PhysAddr::from(VMSA_PHYS[id].load(Ordering::Relaxed));
+    let features = VMSA_FEAT[id].load(Ordering::Relaxed);
+    if vmsa_pa.is_null() {
+        log::warn!("Not running in exclusive mode");
         return 1;
     }
     let ctr_mapping = PerCPUPageMappingGuard::create_4k(ctr_page).unwrap();
@@ -60,9 +58,7 @@ pub fn run_sleep(params: &mut RequestParams) -> Result<(), MonitorError> {
         log::warn!("PauseCpu: core id {} out of range", id);
         return reject(params, crate::process_manager::STATUS_BAD_ID);
     }
-    let ctr_page: PhysAddr = unsafe {
-        CONTROL[id]
-    };
+    let ctr_page: PhysAddr = super::control_page(id);
     if ctr_page.is_null() {
         log::warn!("Control area missing");
         return reject(params, crate::process_manager::STATUS_BAD_STATE);
@@ -101,17 +97,13 @@ pub fn run_exit(params: &mut RequestParams) -> Result<(), MonitorError> {
         return reject(params, crate::process_manager::STATUS_BAD_ID);
     }
 
-    let vmsa_pa = unsafe {
-        VMSA_PHYS[id]
-    };
+    let vmsa_pa = PhysAddr::from(VMSA_PHYS[id].load(Ordering::Relaxed));
     if vmsa_pa.is_null() {
         log::warn!("Not running in exclusive mode");
         return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
 
-    let ctr_page: PhysAddr = unsafe {
-        CONTROL[id]
-    };
+    let ctr_page: PhysAddr = super::control_page(id);
     if ctr_page.is_null() {
         log::warn!("Control area missing");
         return reject(params, crate::process_manager::STATUS_BAD_STATE);

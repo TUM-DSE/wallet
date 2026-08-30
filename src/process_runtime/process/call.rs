@@ -20,6 +20,10 @@ use super::super::PALContext;
 /// design needs; deeper nesting is rejected loudly rather than
 /// silently misbehaving.
 const MAX_CALL_DEPTH: u32 = 4;
+/* Left as static mut deliberately (atomic-slot-state): accessed only
+   by the vCPU running the invoke, never cross-core - but GLOBAL where
+   it should be per-apic-id, so two concurrent invokes share one
+   depth/stack (known issue; atomics would not fix the sharing). */
 static mut CALL_DEPTH: u32 = 0;
 
 /// Ids of the trustlets currently on the call stack, so a cycle can be

@@ -99,17 +99,19 @@ pub fn log_overbudget_invokes(scanning_core: usize, relay_last_id: i64) {
     use crate::process_manager::process::{ProcessID, TrustedProcessType};
     // Per-core rate limit: callers sit in poll loops, so without it a
     // stuck invoke would log every iteration instead of every ~10 s.
-    static mut LAST_REPORT: [u64; 64] = [0; 64];
+    use core::sync::atomic::{AtomicU64, Ordering};
+    #[allow(clippy::declare_interior_mutable_const)]
+    const AU64_ZERO: AtomicU64 = AtomicU64::new(0);
+    static LAST_REPORT: [AtomicU64; 64] = [AU64_ZERO; 64];
     if scanning_core >= 64 {
         return;
     }
     let now = rdtsc();
-    unsafe {
-        if now.wrapping_sub(LAST_REPORT[scanning_core]) < ticks_for_secs(10) {
-            return;
-        }
-        LAST_REPORT[scanning_core] = now;
+    let last = LAST_REPORT[scanning_core].load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < ticks_for_secs(10) {
+        return;
     }
+    LAST_REPORT[scanning_core].store(now, Ordering::Relaxed);
     let budget = ticks_for_secs(INVOKE_BUDGET_SECS);
     for i in 0..PROCESS_STORE.len() {
         let p = PROCESS_STORE.get(ProcessID(i));

@@ -1,6 +1,6 @@
 
 use crate::{memory::paging::PerCPUPageMappingGuard, MonitorError, RequestParams};
-use core::sync::atomic::{AtomicU8, AtomicU32};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicBool};
 use core::sync::atomic::Ordering;
 use crate::address::Address;
 use crate::address::PhysAddr;
@@ -33,7 +33,33 @@ pub struct CommunicationPage {
 
 const _: () = assert!(core::mem::size_of::<CommunicationPage>() == 4096);
 
-static mut ENGINE_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
+/* Slot-state publication protocol (atomic-slot-state branch): all
+   cross-core bookkeeping below is per-field atomics - the release
+   build legally caches plain static-mut loads (observed: a deferred
+   stop delivered against a stale service page). Convention, copied
+   from CommunicationPage and stream.rs: payload fields store/load
+   Relaxed, each published GROUP has ONE gate field written last with
+   Release and read first with Acquire; low-frequency control writes
+   use SeqCst. PhysAddr round-trips through u64 (null == 0). */
+#[allow(clippy::declare_interior_mutable_const)]
+const APA_NULL: AtomicU64 = AtomicU64::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const AU64_ZERO: AtomicU64 = AtomicU64::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const ABOOL_FALSE: AtomicBool = AtomicBool::new(false);
+#[inline(always)]
+fn pa_load(a: &AtomicU64, o: Ordering) -> PhysAddr {
+    PhysAddr::from(a.load(o))
+}
+#[inline(always)]
+fn pa_store(a: &AtomicU64, v: PhysAddr, o: Ordering) {
+    a.store(u64::from(v), o)
+}
+
+/// Gate of the whole engine slot: publish LAST (Release) at
+/// registration, null (Release) at teardown AFTER the retirement
+/// group is armed; the pollers re-read it Acquire every iteration.
+static ENGINE_PAGES: [AtomicU64; 64] = [APA_NULL; 64];
 
 /// Monitor-allocated comm page of a DEAD trustlet session on this
 /// core, awaiting reclamation (F4). Freeing it inside free_engine_slot
@@ -42,30 +68,30 @@ static mut ENGINE_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
 /// to the next engine registration on the core, by which point the
 /// poller has long gone idle. Guest-client pages are never stashed
 /// here: those are guest memory, not the monitor's to free.
-static mut RETIRED_ENGINE_PAGE: [PhysAddr; 64] = [PhysAddr::null(); 64];
+static RETIRED_ENGINE_PAGE: [AtomicU64; 64] = [APA_NULL; 64];
 
-static mut ENGINE_PAGE_TABLE: [PhysAddr; 64] = [PhysAddr::null(); 64];
+static ENGINE_PAGE_TABLE: [AtomicU64; 64] = [APA_NULL; 64];
 
 /// Fallback service page: one service process serving whichever engine
 /// is polling. Used when a service registers without naming an engine,
 /// which is what the pre-per-engine service binary does.
-static mut SERVICE_PAGE: PhysAddr = PhysAddr::null();
+static SERVICE_PAGE: AtomicU64 = AtomicU64::new(0);
 
 /// Per-engine service pages, indexed like ENGINE_PAGES (by polling
 /// core). One service PROCESS per engine is what actually isolates
 /// engines from each other: separate contexts inside one process do
 /// not (measured - see PLAN.md Stage D-0), and a shared process also
 /// shares its fixed-size module/kernel tables across sessions.
-static mut SERVICE_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
+static SERVICE_PAGES: [AtomicU64; 64] = [APA_NULL; 64];
 
 /// Which service page relays for `core`: its own if one registered,
 /// otherwise the shared fallback.
 fn service_page_for(core: usize) -> PhysAddr {
-    let own = unsafe { SERVICE_PAGES[core] };
+    let own = pa_load(&SERVICE_PAGES[core], Ordering::Acquire);
     if own != PhysAddr::null() {
         return own;
     }
-    unsafe { SERVICE_PAGE }
+    pa_load(&SERVICE_PAGE, Ordering::Acquire)
 }
 
 pub fn register_service(params: &mut RequestParams) -> Result<(), MonitorError> {
@@ -84,13 +110,11 @@ pub fn register_service(params: &mut RequestParams) -> Result<(), MonitorError> 
         return crate::process_manager::reject(
             params, crate::process_manager::STATUS_BAD_ARGS);
     }
-    unsafe {
-        if engine < 64 {
-            SERVICE_PAGES[engine] = PhysAddr::from(comm_page);
-        } else {
-            SERVICE_PAGE = PhysAddr::from(comm_page);
-        }
-    };
+    if engine < 64 {
+        pa_store(&SERVICE_PAGES[engine], PhysAddr::from(comm_page), Ordering::SeqCst);
+    } else {
+        pa_store(&SERVICE_PAGE, PhysAddr::from(comm_page), Ordering::SeqCst);
+    }
     /* Return a defined status. Without this rcx still holds the comm
        page address on the way out, and libwallet - which takes the
        ioctl result as an int and treats negative as failure - reports
@@ -118,22 +142,29 @@ pub const GPU_WINDOW_MAX_PAGES: usize = 512; // list must fit one page
 
 /// Per-engine window page lists (monitor-owned copies), indexed like
 /// SERVICE_PAGES, plus the legacy any-engine fallback slot.
-static mut WINDOW_LISTS: [PhysAddr; 64] = [PhysAddr::null(); 64];
-static mut WINDOW_NPAGES: [u64; 64] = [0; 64];
-static mut WINDOW_LIST_ANY: PhysAddr = PhysAddr::null();
-static mut WINDOW_NPAGES_ANY: u64 = 0;
+/* NPAGES is the gate of the (list, npages) pair: retracted to 0
+   (Release) before a re-registration rewrites the copy page in
+   place, republished (Release) after; readers load it Acquire
+   FIRST, then the list. */
+static WINDOW_LISTS: [AtomicU64; 64] = [APA_NULL; 64];
+static WINDOW_NPAGES: [AtomicU64; 64] = [AU64_ZERO; 64];
+static WINDOW_LIST_ANY: AtomicU64 = AtomicU64::new(0);
+static WINDOW_NPAGES_ANY: AtomicU64 = AtomicU64::new(0);
 
 /// Which window serves `core`: its own if one registered, otherwise
 /// the shared fallback. Returns the monitor-owned list page and the
 /// number of valid entries (0 = no window).
 pub fn window_for(core: usize) -> (PhysAddr, usize) {
-    unsafe {
-        if core < 64 && WINDOW_LISTS[core] != PhysAddr::null()
-            && WINDOW_NPAGES[core] != 0 {
-            return (WINDOW_LISTS[core], WINDOW_NPAGES[core] as usize);
+    // gate first (Acquire), payload second - and each loaded once
+    if core < 64 {
+        let n = WINDOW_NPAGES[core].load(Ordering::Acquire);
+        let list = pa_load(&WINDOW_LISTS[core], Ordering::Relaxed);
+        if n != 0 && list != PhysAddr::null() {
+            return (list, n as usize);
         }
-        (WINDOW_LIST_ANY, WINDOW_NPAGES_ANY as usize)
     }
+    let n = WINDOW_NPAGES_ANY.load(Ordering::Acquire);
+    (pa_load(&WINDOW_LIST_ANY, Ordering::Relaxed), n as usize)
 }
 
 pub fn register_window(params: &mut RequestParams) -> Result<(), MonitorError> {
@@ -157,10 +188,17 @@ pub fn register_window(params: &mut RequestParams) -> Result<(), MonitorError> {
        time list, not whatever the guest wrote in between. The page is
        reused across re-registrations (fresh service per session), so
        it is one page per engine slot for the monitor's lifetime. */
-    let slot = unsafe {
-        if engine < 64 { WINDOW_LISTS[engine] } else { WINDOW_LIST_ANY }
+    let (list_cell, npages_cell) = if engine < 64 {
+        (&WINDOW_LISTS[engine], &WINDOW_NPAGES[engine])
+    } else {
+        (&WINDOW_LIST_ANY, &WINDOW_NPAGES_ANY)
     };
+    let slot = pa_load(list_cell, Ordering::Relaxed);
     let copy = if slot == PhysAddr::null() { allocate_page() } else { slot };
+    /* Retract before rewriting the copy page in place: with npages
+       unchanged the old code republished IDENTICAL gate values over
+       new contents - no publication at all. */
+    npages_cell.store(0, Ordering::Release);
     {
         let (_guest_mapping, guest_list) = paddr_as_slice!(list_phys);
         let (_copy_mapping, copy_list) = paddr_as_slice!(copy);
@@ -168,15 +206,8 @@ pub fn register_window(params: &mut RequestParams) -> Result<(), MonitorError> {
             copy_list[i] = guest_list[i];
         }
     }
-    unsafe {
-        if engine < 64 {
-            WINDOW_LISTS[engine] = copy;
-            WINDOW_NPAGES[engine] = npages as u64;
-        } else {
-            WINDOW_LIST_ANY = copy;
-            WINDOW_NPAGES_ANY = npages as u64;
-        }
-    }
+    pa_store(list_cell, copy, Ordering::Relaxed);
+    npages_cell.store(npages as u64, Ordering::Release);
     log::warn!("GPU window registration: {} pages ({} KiB), engine {}",
                npages, npages * 4, engine);
     params.rcx = 0;
@@ -204,14 +235,17 @@ pub const GPU_HEAP_VADDR: u64 = 0x48100000000;
 /// Per-engine heap page directories: one monitor page of pointers to
 /// monitor pages of physical addresses (512 * 512 pages = 1 GiB max),
 /// plus the any-engine fallback slot, mirroring windows/services.
-static mut HEAP_DIRS: [PhysAddr; 64] = [PhysAddr::null(); 64];
-static mut HEAP_NPAGES: [u64; 64] = [0; 64];
-static mut HEAP_DIR_ANY: PhysAddr = PhysAddr::null();
-static mut HEAP_NPAGES_ANY: u64 = 0;
+/* NPAGES gates the (dir, npages, list contents) group: writers
+   publish contents first, npages last (Release); readers load npages
+   Acquire before dereferencing the directory. */
+static HEAP_DIRS: [AtomicU64; 64] = [APA_NULL; 64];
+static HEAP_NPAGES: [AtomicU64; 64] = [AU64_ZERO; 64];
+static HEAP_DIR_ANY: AtomicU64 = AtomicU64::new(0);
+static HEAP_NPAGES_ANY: AtomicU64 = AtomicU64::new(0);
 
 /// How many heap pages are mapped into the trustlet on `core` (grows
 /// at gpu_channel time and after HEAP_GROW relays).
-static mut HEAP_MAPPED: [u64; 64] = [0; 64];
+static HEAP_MAPPED: [AtomicU64; 64] = [AU64_ZERO; 64];
 
 /// Whether the engine slot on `core` is a monitor-provisioned trustlet
 /// channel (gpu_channel) rather than a guest client (register_engine).
@@ -219,7 +253,7 @@ static mut HEAP_MAPPED: [u64; 64] = [0; 64];
 /// guest client maps the heap itself through vmpl.ko, and writing a
 /// guest process page table from here would corrupt the guest kernel's
 /// bookkeeping.
-static mut ENGINE_IS_TRUSTLET: [bool; 64] = [false; 64];
+static ENGINE_IS_TRUSTLET: [AtomicBool; 64] = [ABOOL_FALSE; 64];
 
 /* Set by free_engine_slot when a LIVE session is torn down (serve
    trustlet deleted, client SIGKILLed): the session's stop (500) was
@@ -229,7 +263,10 @@ static mut ENGINE_IS_TRUSTLET: [bool; 64] = [false; 64];
    session), and the donated core is the only place that can block that
    long without the VMPL0-residency IPI hazard. Handled BEFORE any
    relaying, so the next session cannot race the reset. */
-static mut PENDING_SERVICE_STOP: [bool; 64] = [false; 64];
+/* Gate of the stop pair: PENDING_STOP_PAGE is written Relaxed
+   BEFORE this flips true (Release); the poller loads the flag
+   Acquire, then the page. */
+static PENDING_SERVICE_STOP: [AtomicBool; 64] = [ABOOL_FALSE; 64];
 /* The service page the dead session was relayed to, captured when the
    stop is armed. The poller often exits poll_engine (registration
    already nulled) before it can notice the flag, so the stop is
@@ -238,15 +275,19 @@ static mut PENDING_SERVICE_STOP: [bool; 64] = [false; 64];
    fresh service killed it (exit-on-stop) or forced a pointless reset:
    deliver only while the registration still IS the dead session's
    service. */
-static mut PENDING_STOP_PAGE: [PhysAddr; 64] = [PhysAddr::null(); 64];
+static PENDING_STOP_PAGE: [AtomicU64; 64] = [APA_NULL; 64];
 
 fn heap_for(core: usize) -> (PhysAddr, usize) {
-    unsafe {
-        if core < 64 && HEAP_DIRS[core] != PhysAddr::null() && HEAP_NPAGES[core] != 0 {
-            return (HEAP_DIRS[core], HEAP_NPAGES[core] as usize);
+    // gate first (Acquire), payload second - each loaded once
+    if core < 64 {
+        let n = HEAP_NPAGES[core].load(Ordering::Acquire);
+        let dir = pa_load(&HEAP_DIRS[core], Ordering::Relaxed);
+        if n != 0 && dir != PhysAddr::null() {
+            return (dir, n as usize);
         }
-        (HEAP_DIR_ANY, HEAP_NPAGES_ANY as usize)
     }
+    let n = HEAP_NPAGES_ANY.load(Ordering::Acquire);
+    (pa_load(&HEAP_DIR_ANY, Ordering::Relaxed), n as usize)
 }
 
 /// Physical address of heap page `idx` from directory `dir`.
@@ -292,34 +333,33 @@ pub fn register_heap(params: &mut RequestParams) -> Result<(), MonitorError> {
        either way. The mapped counters go back to zero so gpu_channel
        and the grow hook re-map from the start. */
     if offset == 0 {
-        unsafe {
-            if engine < 64 {
-                HEAP_NPAGES[engine] = 0;
-                HEAP_MAPPED[engine] = 0;
-            } else {
-                HEAP_NPAGES_ANY = 0;
-                for i in 0..64 { HEAP_MAPPED[i] = 0; }
-            }
+        if engine < 64 {
+            HEAP_NPAGES[engine].store(0, Ordering::Release);
+            HEAP_MAPPED[engine].store(0, Ordering::Relaxed);
+        } else {
+            HEAP_NPAGES_ANY.store(0, Ordering::Release);
+            /* pre-existing semantic race with concurrent sessions on
+               other cores - unchanged by the atomicization */
+            for i in 0..64 { HEAP_MAPPED[i].store(0, Ordering::Relaxed); }
         }
     }
-    let current = unsafe {
-        if engine < 64 { HEAP_NPAGES[engine] } else { HEAP_NPAGES_ANY }
-    } as usize;
+    let current = (if engine < 64 {
+        HEAP_NPAGES[engine].load(Ordering::Relaxed)
+    } else {
+        HEAP_NPAGES_ANY.load(Ordering::Relaxed)
+    }) as usize;
     if offset != current {
         log::warn!("GPU heap registration rejected: offset {} != current {} \
                     (append-only)", offset, current);
         return reject(params, crate::process_manager::STATUS_BAD_STATE);
     }
-    let dir = unsafe {
-        if engine < 64 { HEAP_DIRS[engine] } else { HEAP_DIR_ANY }
-    };
+    let dir_cell = if engine < 64 { &HEAP_DIRS[engine] } else { &HEAP_DIR_ANY };
+    let dir = pa_load(dir_cell, Ordering::Relaxed);
     let dir = if dir == PhysAddr::null() {
         let d = allocate_page();
         let (_m, dp) = paddr_as_slice!(d);
         for i in 0..512 { dp[i] = 0; }
-        unsafe {
-            if engine < 64 { HEAP_DIRS[engine] = d; } else { HEAP_DIR_ANY = d; }
-        }
+        pa_store(dir_cell, d, Ordering::Relaxed);
         d
     } else { dir };
 
@@ -340,9 +380,11 @@ pub fn register_heap(params: &mut RequestParams) -> Result<(), MonitorError> {
         let (_lm, list_page) = paddr_as_slice!(list);
         list_page[idx % 512] = guest_list[i];
     }
-    unsafe {
-        if engine < 64 { HEAP_NPAGES[engine] = (offset + npages) as u64; }
-        else { HEAP_NPAGES_ANY = (offset + npages) as u64; }
+    // contents are in place - publish the new extent (the gate)
+    if engine < 64 {
+        HEAP_NPAGES[engine].store((offset + npages) as u64, Ordering::Release);
+    } else {
+        HEAP_NPAGES_ANY.store((offset + npages) as u64, Ordering::Release);
     }
     log::warn!("GPU heap registration: +{} pages at {} ({} KiB total), engine {}",
                npages, offset, (offset + npages) * 4, engine);
@@ -387,18 +429,18 @@ pub fn map_heap_range(cr3: PhysAddr, dir: PhysAddr, from: usize, to: usize) -> u
 /// fresh trustlet and record the trustlet-ness of the slot. Returns
 /// mapped bytes (0 = no heap).
 pub fn map_heap_for_trustlet(core: usize, cr3: PhysAddr) -> u64 {
-    unsafe { ENGINE_IS_TRUSTLET[core] = true; }
+    ENGINE_IS_TRUSTLET[core].store(true, Ordering::Relaxed);
     let (dir, npages) = heap_for(core);
     if dir == PhysAddr::null() || npages == 0 {
-        unsafe { HEAP_MAPPED[core] = 0; }
+        HEAP_MAPPED[core].store(0, Ordering::Relaxed);
         return 0;
     }
     let mapped = map_heap_range(cr3, dir, 0, npages);
-    unsafe { HEAP_MAPPED[core] = mapped as u64; }
+    HEAP_MAPPED[core].store(mapped as u64, Ordering::Relaxed);
     if mapped != npages {
         log::warn!("gpu heap: mapped {}/{} pages for core {} - heap not exposed",
                    mapped, npages, core);
-        unsafe { HEAP_MAPPED[core] = 0; }
+        HEAP_MAPPED[core].store(0, Ordering::Relaxed);
         return 0;
     }
     (mapped as u64) * 4096
@@ -436,7 +478,7 @@ pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
                 params, crate::process_manager::STATUS_BAD_ID);
         }
         let owned = PhysAddr::from(page_table);
-        if owned.is_null() || unsafe { ENGINE_PAGES[id] } != owned {
+        if owned.is_null() || pa_load(&ENGINE_PAGES[id], Ordering::Acquire) != owned {
             log::info!("engine release core {}: slot no longer {:#x?}, ignored",
                        id, owned);
             return Ok(());
@@ -460,16 +502,18 @@ pub fn register_engine(params: &mut RequestParams) -> Result<(), MonitorError> {
     }
 
     reclaim_retired_engine_page(id);
-    unsafe {
-        ENGINE_PAGE_TABLE[id] = PhysAddr::from(page_table);
-        ENGINE_PAGES[id] = PhysAddr::from(comm_page);
-        /* Guest client: the monitor must never write this page table
-           (the guest kernel owns it); heap mapping is the client's own
-           mmap business. */
-        ENGINE_IS_TRUSTLET[id] = false;
-    };
+    /* Bookkeeping BEFORE the gate: the old order published
+       ENGINE_PAGES first, so a poller could relay a fresh guest
+       client with the previous session's stale IS_TRUSTLET=true and
+       take the trustlet-only page-table-write branch. */
+    pa_store(&ENGINE_PAGE_TABLE[id], PhysAddr::from(page_table), Ordering::Relaxed);
+    /* Guest client: the monitor must never write this page table
+       (the guest kernel owns it); heap mapping is the client's own
+       mmap business. */
+    ENGINE_IS_TRUSTLET[id].store(false, Ordering::Relaxed);
+    pa_store(&ENGINE_PAGES[id], PhysAddr::from(comm_page), Ordering::Release);
 
-    let donated = unsafe { crate::exclusive::CONTROL[id] } != PhysAddr::null();
+    let donated = crate::exclusive::control_page(id) != PhysAddr::null();
     params.rcx = donated as u64;
 
     Ok(())
@@ -484,18 +528,28 @@ pub fn free_engine_slot(core: usize) {
     if core >= 64 {
         return;
     }
-    let had_session = unsafe { ENGINE_PAGES[core] != PhysAddr::null() };
-    unsafe {
-        /* Trustlet sessions use a monitor-allocated comm page - stash
-           it for deferred reclamation (see RETIRED_ENGINE_PAGE). A
-           still-stashed page from an earlier session stays leaked
-           rather than freed here: same poller race. */
-        if ENGINE_IS_TRUSTLET[core] && RETIRED_ENGINE_PAGE[core] == PhysAddr::null() {
-            RETIRED_ENGINE_PAGE[core] = ENGINE_PAGES[core];
-        }
-        ENGINE_PAGES[core] = PhysAddr::null();
-        HEAP_MAPPED[core] = 0;
+    let page = pa_load(&ENGINE_PAGES[core], Ordering::Acquire);
+    let had_session = page != PhysAddr::null();
+    /* Trustlet sessions use a monitor-allocated comm page - stash
+       it for deferred reclamation (see RETIRED_ENGINE_PAGE). A
+       still-stashed page from an earlier session stays leaked
+       rather than freed here: same poller race. */
+    if ENGINE_IS_TRUSTLET[core].load(Ordering::Relaxed)
+        && pa_load(&RETIRED_ENGINE_PAGE[core], Ordering::Relaxed) == PhysAddr::null() {
+        pa_store(&RETIRED_ENGINE_PAGE[core], page, Ordering::Relaxed);
     }
+    HEAP_MAPPED[core].store(0, Ordering::Relaxed);
+    /* Arm the whole retirement group BEFORE nulling the gate: any
+       poller that observes the null registration is then guaranteed
+       to observe the armed stop (the old order - null first, arm
+       after - is exactly the interleaving that left 500s undelivered
+       and, under -O3, delivered them to a stale page). Stop-pair
+       order: payload page first (Relaxed), flag last (Release). */
+    if had_session {
+        pa_store(&PENDING_STOP_PAGE[core], service_page_for(core), Ordering::Relaxed);
+        PENDING_SERVICE_STOP[core].store(true, Ordering::Release);
+    }
+    pa_store(&ENGINE_PAGES[core], PhysAddr::null(), Ordering::Release);
     /* Wire the stop the session never sent: a serve-mode trustlet (and
        a SIGKILLed client) dies without the 500, so a persistent
        service kept the session's modules and the NEXT session died on
@@ -506,12 +560,6 @@ pub fn free_engine_slot(core: usize) {
        here: this runs in a guest ioctl's vCPU, and waiting out a
        multi-second service reset at VMPL0 is the parked-CPU IPI
        hazard. */
-    if had_session {
-        unsafe {
-            PENDING_SERVICE_STOP[core] = true;
-            PENDING_STOP_PAGE[core] = service_page_for(core);
-        }
-    }
     log::warn!("engine slot {} freed (owner died)", core);
 }
 
@@ -522,9 +570,9 @@ fn reclaim_retired_engine_page(core: usize) {
     if core >= 64 {
         return;
     }
-    let retired = unsafe { RETIRED_ENGINE_PAGE[core] };
+    let retired = pa_load(&RETIRED_ENGINE_PAGE[core], Ordering::Relaxed);
     if retired != PhysAddr::null() {
-        unsafe { RETIRED_ENGINE_PAGE[core] = PhysAddr::null(); }
+        pa_store(&RETIRED_ENGINE_PAGE[core], PhysAddr::null(), Ordering::Relaxed);
         crate::process_manager::process_paging::revoke_and_free(retired);
         log::info!("gpu: reclaimed retired comm page {:?} on core {}", retired, core);
     }
@@ -533,7 +581,7 @@ fn reclaim_retired_engine_page(core: usize) {
 /// True when a client comm page is registered for `core`. Used by the
 /// donated-core command loop to decide when to enter `poll_engine`.
 pub fn engine_registered(core: usize) -> bool {
-    core < 64 && unsafe { ENGINE_PAGES[core] } != PhysAddr::null()
+    core < 64 && ENGINE_PAGES[core].load(Ordering::Acquire) != 0
 }
 
 /// True when a service (per-engine or legacy) would answer relays for
@@ -550,7 +598,7 @@ pub fn service_registered(core: usize) -> bool {
 /// minutes on large sessions - so the slot picker prefers cores
 /// without this debt.
 pub fn engine_slot_owes_stop(core: usize) -> bool {
-    core < 64 && unsafe { PENDING_SERVICE_STOP[core] }
+    core < 64 && PENDING_SERVICE_STOP[core].load(Ordering::Acquire)
 }
 
 /// Register a monitor-provisioned comm page (trustlet GPU channel) in
@@ -558,13 +606,12 @@ pub fn engine_slot_owes_stop(core: usize) -> bool {
 /// page registered via register_engine.
 pub fn register_engine_page(core: usize, page: PhysAddr, page_table: PhysAddr) {
     reclaim_retired_engine_page(core);
-    unsafe {
-        ENGINE_PAGES[core] = page;
-        /* The bulk path translates client source addresses itself, so it
-           needs the client's page table. The guest-client path records
-           this in register_engine; trustlets come through here. */
-        ENGINE_PAGE_TABLE[core] = page_table;
-    }
+    /* The bulk path translates client source addresses itself, so it
+       needs the client's page table. The guest-client path records
+       this in register_engine; trustlets come through here. Payload
+       before the ENGINE_PAGES gate (old order was inverted). */
+    pa_store(&ENGINE_PAGE_TABLE[core], page_table, Ordering::Relaxed);
+    pa_store(&ENGINE_PAGES[core], page, Ordering::Release);
 }
 
 /// Poll the engine page registered for `core` and relay calls to the
@@ -621,9 +668,9 @@ pub fn poll_engine(core: usize,
            this core's job): the service may spend tens of seconds in
            its reset, and the next session's calls must queue behind
            it, not race it into forward_call's timeout. */
-        if ctr.is_some() && unsafe { PENDING_SERVICE_STOP[core] } {
+        if ctr.is_some() && PENDING_SERVICE_STOP[core].load(Ordering::Acquire) {
             let sp = service_page_for(core);
-            let target = unsafe { PENDING_STOP_PAGE[core] };
+            let target = pa_load(&PENDING_STOP_PAGE[core], Ordering::Relaxed);
             if sp != PhysAddr::null() && sp != target {
                 /* The registration changed since the stop was armed: a
                    fresh service replaced the dead session's one. The
@@ -670,14 +717,12 @@ pub fn poll_engine(core: usize,
                     }
                 }
             }
-            unsafe {
-                PENDING_SERVICE_STOP[core] = false;
-                PENDING_STOP_PAGE[core] = PhysAddr::null();
-            }
+            PENDING_SERVICE_STOP[core].store(false, Ordering::Release);
+            pa_store(&PENDING_STOP_PAGE[core], PhysAddr::null(), Ordering::Relaxed);
             continue;
         }
 
-        let current = unsafe { ENGINE_PAGES[core] };
+        let current = pa_load(&ENGINE_PAGES[core], Ordering::Acquire);
         if current == PhysAddr::null() {
             return LOOP_CLEAR;
         }
@@ -741,7 +786,7 @@ pub fn poll_engine(core: usize,
                new client spun on a page nobody polled. Reproduced by
                running test/transport twice back to back: the second
                run reported "no poller answered the first probe". */
-            unsafe { ENGINE_PAGES[core] = PhysAddr::null(); }
+            pa_store(&ENGINE_PAGES[core], PhysAddr::null(), Ordering::Release);
             args.lock.store(0, Ordering::Release);
             return LOOP_CLEAR;
         }
@@ -787,13 +832,13 @@ pub fn poll_engine(core: usize,
                        TLB shootdown (x86 does not cache not-present).
                        Guest clients map the heap themselves. */
                     if call_id as u64 == HEAP_GROW
-                        && unsafe { ENGINE_IS_TRUSTLET[core] } {
+                        && ENGINE_IS_TRUSTLET[core].load(Ordering::Relaxed) {
                         let (dir, npages) = heap_for(core);
-                        let done = unsafe { HEAP_MAPPED[core] } as usize;
+                        let done = HEAP_MAPPED[core].load(Ordering::Relaxed) as usize;
                         if dir != PhysAddr::null() && npages > done {
-                            let cr3 = unsafe { ENGINE_PAGE_TABLE[core] };
+                            let cr3 = pa_load(&ENGINE_PAGE_TABLE[core], Ordering::Relaxed);
                             let mapped = map_heap_range(cr3, dir, done, npages);
-                            unsafe { HEAP_MAPPED[core] = (done + mapped) as u64; }
+                            HEAP_MAPPED[core].store((done + mapped) as u64, Ordering::Relaxed);
                             if done + mapped != npages {
                                 /* Partial: report the size that IS
                                    mapped so the client never touches
@@ -847,7 +892,7 @@ pub fn run(params: &mut RequestParams) -> Result<(), MonitorError> {
     let first_entry = params.rcx == 0;
     let budget_us = params.rdx.min(MAX_YIELD_BUDGET_US);
 
-    let engine_page = unsafe {ENGINE_PAGES[id]};
+    let engine_page = pa_load(&ENGINE_PAGES[id], Ordering::Acquire);
 
     if first_entry {
         log::warn!("Monitor polling on {:#x?} on thread {} (yield budget {} us)",
@@ -1103,7 +1148,7 @@ fn bulk_memcpy(core: usize, args: &CommunicationPage,
         None => return CUDA_ERROR_SYSTEM_NOT_READY,
     };
 
-    let table = unsafe { ENGINE_PAGE_TABLE[core] };
+    let table = pa_load(&ENGINE_PAGE_TABLE[core], Ordering::Relaxed);
     if table == PhysAddr::null() {
         log::warn!("bulk_memcpy: no page table registered for engine {}", core);
         return CUDA_ERROR_INVALID_VALUE;
@@ -1294,11 +1339,9 @@ fn drop_service(core: usize) {
        otherwise the shared fallback was in use. Only clear the one that
        was actually being relayed to - clearing the fallback because one
        engine's private service died would cut off every other engine. */
-    unsafe {
-        if core < 64 && SERVICE_PAGES[core] != PhysAddr::null() {
-            SERVICE_PAGES[core] = PhysAddr::null();
-        } else {
-            SERVICE_PAGE = PhysAddr::null();
-        }
+    if core < 64 && SERVICE_PAGES[core].load(Ordering::Acquire) != 0 {
+        pa_store(&SERVICE_PAGES[core], PhysAddr::null(), Ordering::SeqCst);
+    } else {
+        pa_store(&SERVICE_PAGE, PhysAddr::null(), Ordering::SeqCst);
     }
 }

@@ -5,10 +5,14 @@ use core::sync::atomic::Ordering;
 pub mod r#loop;
 pub mod scheduling;
 
-static mut VMSA_PHYS: [PhysAddr; 64] = [PhysAddr::null(); 64];
-static mut VMSA_FEAT: [u64; 64] = [0; 64];
-
-static mut COM_PAGES: [PhysAddr; 64] = [PhysAddr::null(); 64];
+/* Donation state: CONTROL is the gate ("a donated poller is live"),
+   published LAST (Release) after the VMSA pair and the control-page
+   contents; readers load it Acquire. Payload pair Relaxed. Was bare
+   static mut - -O3 legally cached the loads (atomic-slot-state). */
+#[allow(clippy::declare_interior_mutable_const)]
+const AU64_ZERO: AtomicU64 = AtomicU64::new(0);
+static VMSA_PHYS: [AtomicU64; 64] = [AU64_ZERO; 64];
+static VMSA_FEAT: [AtomicU64; 64] = [AU64_ZERO; 64];
 
 #[derive(Debug)]
 pub struct ControlStruct {
@@ -19,16 +23,27 @@ pub struct ControlStruct {
 
 pub fn set_next(next: &mut AtomicU64, o: u64, n: u64) {
     loop {
-        if next.compare_exchange(o,
-                                 n,
-                                 Ordering::Acquire,
-                                 Ordering::SeqCst) == Ok(o){
+        /* AcqRel/Acquire: the old Acquire-success/SeqCst-failure had
+           the strengths inverted (legal, but the success side is the
+           publication) */
+        if next.compare_exchange(o, n, Ordering::AcqRel, Ordering::Acquire)
+            == Ok(o) {
             break;
         }
     };
 }
 
-pub static mut CONTROL: [PhysAddr; 64] = [PhysAddr::null(); 64];
+static CONTROL: [AtomicU64; 64] = [AU64_ZERO; 64];
+
+/// The donated core's control page (null = not donated). Acquire:
+/// pairs with the Release publication at the end of run_exclusive's
+/// setup, so a non-null result implies the VMSA pair is visible.
+pub fn control_page(core: usize) -> PhysAddr {
+    if core >= 64 {
+        return PhysAddr::null();
+    }
+    PhysAddr::from(CONTROL[core].load(Ordering::Acquire))
+}
 
 /// The core currently donated to the monitor (its exclusive command
 /// loop is live), if any. Used to route trustlet GPU channels to the
@@ -45,7 +60,7 @@ pub fn donated_core() -> Option<usize> {
 
 /// Is this specific core donated (running the exclusive command loop)?
 pub fn is_donated(core: usize) -> bool {
-    core < 64 && unsafe { CONTROL[core] } != PhysAddr::null()
+    control_page(core) != PhysAddr::null()
 }
 
 /// A donated core to REPLACE when no free one exists, rotating over

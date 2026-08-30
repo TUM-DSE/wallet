@@ -3,10 +3,8 @@ use crate::exclusive::scheduling::sleep;
 use crate::{MonitorError, RequestParams};
 use crate::process_manager::process_memory::{allocate_page, free_page};
 use crate::memory::paging::PerCPUPageMappingGuard;
-use crate::exclusive::{get_apic_id, ControlStruct, COM_PAGES, CONTROL, LOOP_CLEAR, LOOP_EXIT, LOOP_SLEEP, LOOP_WAKEUP, VMSA_FEAT, VMSA_PHYS};
+use crate::exclusive::{get_apic_id, ControlStruct, CONTROL, LOOP_CLEAR, LOOP_EXIT, LOOP_SLEEP, LOOP_WAKEUP, VMSA_FEAT, VMSA_PHYS};
 use crate::address::PhysAddr;
-use crate::types::PageSize;
-use crate::sev::{rmp_adjust, RMPFlags};
 
 extern "Rust" {
     fn wallet_get_vmsa() -> PhysAddr;
@@ -48,28 +46,17 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
     ctr.next.store(LOOP_CLEAR, Ordering::Relaxed);
     ctr.hlt.store(0, Ordering::Relaxed);
 
+    /* COM_PAGES deleted (write-only, zero readers in the crate); its
+       comm page allocation went with it. Publication order: control
+       page contents + VMSA pair FIRST, then CONTROL (the "poller
+       live" gate is_donated/register_engine/wakeup read) LAST with
+       Release - the old order raised the gate before the state
+       existed. */
     unsafe {
-        CONTROL[id] = ctr_page;
+        VMSA_PHYS[id].store(u64::from(wallet_get_vmsa()), Ordering::Relaxed);
+        VMSA_FEAT[id].store(wallet_get_features(), Ordering::Relaxed);
     };
-
-
-    let comm_page_phy = allocate_page();
-    let mapping = PerCPUPageMappingGuard::create_4k(comm_page_phy).unwrap();
-
-    let _ = rmp_adjust(mapping.virt_addr(), RMPFlags::VMPL2 | RMPFlags::RWX, PageSize::Regular);
-
-    //Register control struct
-    unsafe {
-        COM_PAGES[id] = comm_page_phy;
-    }
-
-    unsafe {
-        VMSA_PHYS[id] = wallet_get_vmsa();
-        VMSA_FEAT[id] = wallet_get_features();
-        //log::warn!("What");
-        //VMSA_FEAT[id] = wallet_get_features();
-        //log::warn!("What2");
-    };
+    CONTROL[id].store(u64::from(ctr_page), Ordering::Release);
     //use core::arch::asm;
     log::warn!("Reserving CPU for Monitor: {}", id);
     //unsafe { asm!("hlt"); };
@@ -134,11 +121,10 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         crate::model_store::stream::poll_worker(id);
     }
 
-    unsafe {
-        CONTROL[id] = PhysAddr::null();
-        VMSA_PHYS[id] = PhysAddr::null();
-        VMSA_FEAT[id] = 0;
-    };
+    // teardown: gate down first, then the payload
+    CONTROL[id].store(0, Ordering::Release);
+    VMSA_PHYS[id].store(0, Ordering::Relaxed);
+    VMSA_FEAT[id].store(0, Ordering::Relaxed);
     free_page(ctr_page);
     Ok(())
 }
