@@ -82,8 +82,19 @@ pub fn run_exclusive(_params: &mut RequestParams) -> Result<(), MonitorError> {
         // re-reads the registration every iteration, so a crashed
         // client is replaced by the next one's registration without
         // any reboot.
-        if crate::gpu::direct::engine_registered(id)
-            || crate::gpu::direct::engine_slot_owes_stop(id) {
+        /* Deliberately NOT gated on engine_slot_owes_stop: prompt
+           delivery ran the dead session's 123-module cuModuleUnload
+           CONCURRENTLY with the next session's module loads on the
+           other engine, and the CC driver wedges on interleaved
+           unload/load (both services dark >120 s, release-monitor
+           timing made it deterministic). An armed stop is now
+           published BEFORE the registration nulls (free_engine_slot),
+           so it cannot be lost; poll_engine's pending-stop-first
+           branch delivers it when THIS slot's next session enters -
+           serializing the reset against that session's calls, which
+           is the documented queue-behind design. The slot pickers
+           still avoid owes-stop cores (debt avoidance). */
+        if crate::gpu::direct::engine_registered(id) {
             /* Hand a claimed stream worker off BEFORE blocking for the
                whole GPU session: the hash state is preserved for the
                next claimer (stream::detach_core), and with no free
