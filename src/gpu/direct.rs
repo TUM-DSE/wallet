@@ -952,6 +952,11 @@ fn forward_spec(call_id: u32, data: &[u8; COMM_DATA_SIZE]) -> Option<(usize, usi
         let args_len =
             u32::from_le_bytes(data[48..52].try_into().unwrap()) as usize;
         Some((LAUNCH_HDR + args_len.min(LAUNCH_MAX_ARGS), 4))
+    } else if id == 505 {
+        // fatbin via the shared heap: u64 heap offset + u64 size in;
+        // i32 err + u32 module id back. The bytes never touch the
+        // relay - the service loads the module from its own memory.
+        Some((16, 8))
     } else if id == 501 {
         // fatbin init: u64 total size in; i32 err back
         Some((8, 4))
@@ -1240,7 +1245,7 @@ fn slow_call_bound(call_id: u32) -> u64 {
         37 | 38 | 47 | 93 | 94 | 97 | 98 | 101 => SLOW_CALL_TIMEOUT_SECS,
         // fatbin transfer + kernel registration (module load JITs) and
         // cuBLAS handle creation - all one-per-session setup calls
-        501..=504 | 600 => SLOW_CALL_TIMEOUT_SECS,
+        501..=505 | 600 => SLOW_CALL_TIMEOUT_SECS,
         _ => FORWARD_TIMEOUT_SECS,
     }
 }
