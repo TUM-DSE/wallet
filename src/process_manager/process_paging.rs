@@ -226,9 +226,9 @@ impl ProcessPageTableRef {
             let new_page = allocate_page();
             let (_mapping, mapping_vaddr) = map_paddr!(new_page);
             let mapped_page = unsafe { &mut *mapping_vaddr.as_mut_ptr::<[u8;4096]>() };
-            for j in 0..4096 {
-                mapped_page[j] = data[j + i * 4096];
-            }
+            /* was a byte-at-a-time loop: ~0.6-1 s of the llama zygote's
+               213 MB libos install in the unoptimized build */
+            mapped_page.copy_from_slice(&data[i * 4096..(i + 1) * 4096]);
             let target_addr = vaddr + i * 4096;
             self.map_4k_page(VirtAddr::from(target_addr), new_page, page_flags);
             rmp_adjust(mapping_vaddr, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap()
@@ -264,14 +264,11 @@ impl ProcessPageTableRef {
             let (_mapping, mapping_vaddr) = map_paddr!(new_page);
             let mapped_page = unsafe { &mut *mapping_vaddr.as_mut_ptr::<[u8;4096]>()};
             rmp_adjust(mapping_vaddr, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
-            for j in 0..4096 {
-                if file_size > 0 {
-                    mapped_page[j] = elf[(offset+(j as u64)) as usize + (i * PAGE_SIZE_4K) as usize];
-                    file_size -= 1;
-                } else {
-                    mapped_page[j] = 0;
-                }
-            }
+            let copy = (file_size as usize).min(4096);
+            let src = (offset + i * PAGE_SIZE_4K) as usize;
+            mapped_page[..copy].copy_from_slice(&elf[src..src + copy]);
+            mapped_page[copy..].fill(0);
+            file_size -= copy as u64;
             let target_addr = vaddr + i * PAGE_SIZE_4K;
             self.map_4k_page(VirtAddr::from(target_addr), new_page, page_flags);
         }
