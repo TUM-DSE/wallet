@@ -1,4 +1,6 @@
 use crate::{address::{Address, PhysAddr, VirtAddr}, paddr_as_table, process_manager::process_memory::allocate_page, sev::{rmp_adjust, RMPFlags}};
+use crate::sev::{pvalidate, PvalidateOp, SevSnpError};
+use crate::sev::utils::SvsmError;
 use crate::interop::memory::flush_tlb_global;
 use crate::{paddr_as_slice, paddr_as_u64_slice, vaddr_as_u64_slice, vaddr_as_slice, map_paddr, strip_paddr};
 use crate::process_manager::memory_helper::{strip_c_bit, set_c_bit_in_address};
@@ -295,6 +297,124 @@ impl ProcessPageTableRef {
         let data: *mut u8 = data.as_mut_ptr::<u8>();
         let data = unsafe { slice::from_raw_parts(data, size as usize) };
         self.add_region_vaddr(VirtAddr::from(TP_MANIFEST_START_VADDR), data);
+    }
+
+    /// Walk-and-create down to the PTE table covering `va` in THIS
+    /// process page table (fresh zygote PTs included: missing entries
+    /// are created at every level). Table pages come from
+    /// allocate_page (zeroed contract) and are granted VMPL1|RWX once
+    /// at creation - the VMPL1 walker reads them; no VMPL2, unlike
+    /// the model store's guest-visible tables.
+    fn ensure_pte_table_owned(&self, va: VirtAddr) -> PhysAddr {
+        let table_flags = ProcessPageFlags::PRESENT | ProcessPageFlags::WRITABLE
+            | ProcessPageFlags::USER_ACCESSIBLE | ProcessPageFlags::ACCESSED;
+        loop {
+            let (_g, pgd_table) = paddr_as_table!(self.process_page_table);
+            let level = self.page_walk(&pgd_table, self.process_page_table, va);
+            let (table_phys, idx) = match level {
+                ProcessTableLevelMapping::PTE(t, _) => return t,
+                ProcessTableLevelMapping::PMD(t, i) => (t, i),
+                ProcessTableLevelMapping::PUD(t, i) => (t, i),
+                ProcessTableLevelMapping::PGD(t, i) => (t, i),
+            };
+            let new = allocate_page();
+            {
+                let (guard, _va) = map_paddr!(new);
+                rmp_adjust(guard.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX,
+                           PageSize::Regular).unwrap();
+            }
+            let (_g2, table) = paddr_as_table!(table_phys);
+            table[idx].set(new, table_flags);
+            // loop: re-walk descends one level further per iteration
+        }
+    }
+
+    /// Fused libos install (cold-path-opt): copy the blob straight
+    /// from the guest walk into freshly allocated pages of this page
+    /// table at TP_LIBOS_START_VADDR, hashing inline. Replaces the
+    /// staging copy + byte-loop reinstall + one-shot hash triple
+    /// (2.7 s + 3.7 s + 0.4 s for the 213 MB llama libsysdb at ~18
+    /// mapping guards per 4 KiB). Per PTE-table span: one table
+    /// ensure, one batch allocation, direct PTE writes; per page one
+    /// destination guard under which bump pages are pvalidated, the
+    /// bytes are copied (huge-page-aware guest lookup) and hashed,
+    /// and the VMPL1|RWX grant is issued. Returns the SHA-512 over
+    /// exactly `size` bytes - the digest measure() computed on the
+    /// staging copy. The extra trailing page the old rounding
+    /// installed is preserved but zeroed instead of garbage.
+    pub fn install_libos_from_guest(&self, guest_va: u64, size: u64,
+                                    guest_pgt: u64) -> [u8; 64] {
+        use crate::crypto::{sha512_create, sha512_update, sha512_digest};
+        let mut guest_ref = ProcessPageTableRef::default();
+        guest_ref.set_external_table(guest_pgt);
+        let state = unsafe { sha512_create() };
+        let data_flags = ProcessPageFlags::data();
+        let total_pages = size / 4096 + 1; // old add_libos rounding: +1 page
+        let mut page_idx: u64 = 0;
+        while page_idx < total_pages {
+            let va = TP_LIBOS_START_VADDR + page_idx * 4096;
+            let idx0 = ((va >> 12) & 0x1ff) as usize;
+            let count = core::cmp::min((512 - idx0) as u64,
+                                       total_pages - page_idx) as usize;
+            let pte_phys = self.ensure_pte_table_owned(VirtAddr::from(va));
+            let mut pages = [PhysAddr::null(); 512];
+            let (pool_n, n) = crate::process_manager::process_memory
+                ::allocate_pages_batch_unzeroed(&mut pages[..count]);
+            if n < count {
+                /* zygote() pre-flighted the sizes against
+                   pages_available; running dry here is the same
+                   monitor OOM the old per-page allocate_page died on */
+                panic!("install_libos: allocator exhausted ({} of {})", n, count);
+            }
+            {
+                let (_g, pte_table) = paddr_as_table!(pte_phys);
+                for i in 0..count {
+                    pte_table[idx0 + i].set(pages[i], data_flags);
+                }
+            }
+            for i in 0..count {
+                let gp = page_idx + i as u64;
+                let (guard, dst_va) = map_paddr!(pages[i]);
+                if i >= pool_n {
+                    match pvalidate(dst_va, PageSize::Regular, PvalidateOp::Valid) {
+                        Ok(()) => (),
+                        Err(SvsmError::SevSnp(SevSnpError::FAIL_UNCHANGED(_))) => (),
+                        Err(e) => panic!("install_libos: pvalidate: {:?}", e),
+                    }
+                }
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(dst_va.as_mut_ptr::<u8>(), 4096)
+                };
+                if gp * 4096 < size {
+                    let src_phys = guest_ref.get_page_4k_hugeaware(
+                        VirtAddr::from(guest_va + gp * 4096));
+                    if src_phys == PhysAddr::null() {
+                        panic!("install_libos: guest page {} unmapped", gp);
+                    }
+                    {
+                        let (_sg, src_va) = map_paddr!(src_phys);
+                        let src = unsafe {
+                            core::slice::from_raw_parts(src_va.as_ptr::<u8>(), 4096)
+                        };
+                        dst.copy_from_slice(src);
+                    }
+                    /* hash the INSTALLED bytes - one read of what the
+                       zygote will actually run, no TOCTOU vs a second
+                       guest read */
+                    unsafe { sha512_update(dst.as_mut_ptr(), 4096, state) };
+                } else {
+                    dst.fill(0);
+                }
+                rmp_adjust(guard.virt_addr(), RMPFlags::VMPL1 | RMPFlags::RWX,
+                           PageSize::Regular).unwrap();
+            }
+            page_idx += count as u64;
+        }
+        let mut digest = [0u8; 64];
+        unsafe { sha512_digest(digest.as_mut_ptr(), state) };
+        // same visibility measure() gave the staging-copy digest
+        log::debug!("[Measure] fused libos hash {:?}", &digest[..16]);
+        digest
     }
 
     pub fn add_libos(&self, data: VirtAddr, size: u64) {

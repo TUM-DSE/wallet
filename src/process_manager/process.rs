@@ -231,6 +231,15 @@ impl ProcessBaseContext {
         //self.alloc_range_libos.1 = orig_size;
     }
 
+    /// Fused replacement for copy_data_from_guest + measure +
+    /// add_libos on the libos blob: install straight from the guest
+    /// walk, hash inline, return the measurement. Same installed
+    /// layout as add_libos (incl. its +1-page rounding, zeroed).
+    pub fn add_libos_from_guest(&mut self, guest_va: u64, size: u64,
+                                guest_pgt: u64) -> [u8; 64] {
+        self.page_table_ref.install_libos_from_guest(guest_va, size, guest_pgt)
+    }
+
     #[allow(unused_variables)]
     pub fn init_with_data(&mut self, elf: VirtAddr, size: u64, data: AllocationRange) {
         self.init(elf, size);

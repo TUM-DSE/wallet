@@ -108,18 +108,15 @@ impl TrustedProcess {
         manifest_range.delete();
         log::debug!("TODO: Compare with manifest measurement of the policy");
 
+        /* Fused single pass (cold-path-opt): the old staging copy +
+           byte-loop reinstall + one-shot hash cost 2.7 + 3.7 + 0.4 s
+           for the 213 MB llama libsysdb. Copy straight from the guest
+           walk into the zygote page table, hashing the installed
+           bytes inline - identical digest by construction. */
         breakdown_outb(230);
-        let (libos_data, libos_range) = ProcessPageTableRef::copy_data_from_guest(libos, libos_size, pgt);
-        breakdown_outb(231);
-        log::debug!("libos_range {:?}", libos_range);
-        breakdown_outb(232);
-        base.add_libos(libos_data, libos_size, libos_range);
+        measurements.libos_measurement =
+            base.add_libos_from_guest(libos, libos_size, pgt);
         breakdown_outb(233);
-        breakdown_outb(198);
-        measurements.libos_measurement = measure(libos_data.into(), libos_size);
-        breakdown_outb(199);
-        libos_range.unmount();
-        libos_range.delete();
         log::debug!("TODO: Compare with libos measurement of the policy");
         breakdown_outb(201);
         let mut context = ProcessContext::default();
