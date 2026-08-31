@@ -189,9 +189,9 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
                boundary (the "first input" of a chain). Build with
                --cfg veritas_no_channel_measure for the no-hashing
                comparison variant. */
-            #[cfg(all(not(feature = "boottime"),
-                      not(veritas_no_channel_measure)))]
-            if function_arg_size > 1 {
+            #[cfg(not(feature = "boottime"))]
+            if option_env!("VERITAS_NO_CHANNEL_MEASURE").is_none()
+                && function_arg_size > 1 {
                 breakdown_outb(190);
                 trustlet.measurements.input_data = trustlet.context.channel.measure_input();
                 breakdown_outb(191);

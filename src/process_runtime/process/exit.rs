@@ -100,9 +100,9 @@ impl ProcessRuntimeExit for PALContext {
            holds the hash of the LAST output that crossed the guest
            boundary. --cfg veritas_no_channel_measure drops channel
            hashing entirely (comparison variant). */
-        #[cfg(all(not(feature = "boottime"),
-                  not(veritas_no_channel_measure)))]
-        if !self.nested_call && self.result_size > 0 {
+        #[cfg(not(feature = "boottime"))]
+        if option_env!("VERITAS_NO_CHANNEL_MEASURE").is_none()
+            && !self.nested_call && self.result_size > 0 {
             breakdown_outb(192);
             self.process.measurements.output_data = self.process.context.channel.measure_output();
             breakdown_outb(193);
