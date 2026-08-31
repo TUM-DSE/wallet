@@ -95,12 +95,10 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
         return crate::process_manager::reject(params, crate::process_manager::STATUS_UNSUPPORTED);
     }
     let call: MonitorCallType = unsafe {core::mem::transmute(request)};
-    /* Same guard as lib.rs: keep serial logging out of the hot loops -
-       GpuApi (per-ioctl benchmark) and GpuRun (bounded parked mode
-       re-enters at ~1 kHz; run() logs its own first-entry line). */
-    let hot = call == MonitorCallType::GpuApi || call == MonitorCallType::GpuRun
-        || call == MonitorCallType::ModelStreamUpdate;
-    if !hot { log::debug!("Montior calle: {:?}", call); }
+    /* Per-call dispatch/finish logging removed for ALL calls
+       (2026-08-31, user request): ~1 ms per serial line made every
+       monitor call cost ~10 ms of console time. Errors and the
+       handlers' own targeted logs remain. */
     let res = match call {
         MonitorCallType::InitMonitor =>
             monitor_init(params),
@@ -211,10 +209,6 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
            wedged the guest vCPU via the Err -> INCOMPLETE retry. */
     };
 
-    if !hot {
-        log::debug!("Monitor call finished: {:?}",res);
-        log::debug!("{:#x?}",params);
-    }
     breakdown_outb(255);
     return res;
 }

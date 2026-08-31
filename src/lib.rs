@@ -53,15 +53,10 @@ pub fn wallet_memory_init() {
 }
 
 pub fn wallet_process_protocol_request(request: u32, params: &mut RequestParams) -> i64 {
-    /* Hot calls carry no per-call logging: GpuApi is the per-ioctl
-       transport probe (test/transport.c) - a serial log per call turns
-       a ~us measurement into ~10 ms - and GpuRun re-enters at ~1 kHz in
-       bounded parked mode, which would flood the console the same way. */
-    use crate::monitor_call_type::MonitorCallType;
-    if request != MonitorCallType::GpuApi as u32
-        && request != MonitorCallType::GpuRun as u32 {
-        log::debug!("{:x?}",params);
-    }
+    /* Per-call entry dump removed for ALL calls (2026-08-31, user
+       request): at ~1 ms per serial line each monitor call cost
+       ~10 ms of console time - the ipc chain lane measured 40 ms/hop
+       with it. Errors still log below. */
     match process_manager::call_handler::monitor_call_handler(request, params) {
         Err(e) => {log::error!("{}", e); return -1;},
         _ => 0
