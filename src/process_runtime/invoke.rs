@@ -180,11 +180,21 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
             if function_arg_size > 1 {
                 trustlet.context.channel.copy_into(function_arg, guest_page_table, function_arg_size as usize);
             }
-            #[cfg(not(feature = "boottime"))]
-            {
-            breakdown_outb(190);
-            trustlet.measurements.input_data = trustlet.context.channel.measure_input();
-            breakdown_outb(191);
+            /* Boundary-only measurement (2026-08-31, user request):
+               hash the input channel only when the guest actually
+               DELIVERED data this invoke (same gate as copy_into
+               above). Empty invokes - chain mid-hops, collect-only
+               turns - keep the previous value, so input_data always
+               holds the hash of the LAST data that crossed the guest
+               boundary (the "first input" of a chain). Build with
+               --cfg veritas_no_channel_measure for the no-hashing
+               comparison variant. */
+            #[cfg(all(not(feature = "boottime"),
+                      not(veritas_no_channel_measure)))]
+            if function_arg_size > 1 {
+                breakdown_outb(190);
+                trustlet.measurements.input_data = trustlet.context.channel.measure_input();
+                breakdown_outb(191);
             }
             breakdown_outb(213);
         } TrustletInvocationType::FILEATTR | TrustletInvocationType::OPEN | TrustletInvocationType::READ => {

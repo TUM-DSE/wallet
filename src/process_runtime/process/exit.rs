@@ -93,11 +93,19 @@ impl ProcessRuntimeExit for PALContext {
                 self.result_size as usize);
         }
         self.return_values.result(TrustletReturnType::GETRESULT as u64);
-        #[cfg(not(feature = "boottime"))]
-        {
-        breakdown_outb(192);
-        self.process.measurements.output_data = self.process.context.channel.measure_output();
-        breakdown_outb(193);
+        /* Boundary-only measurement (2026-08-31, user request): hash
+           the output channel only when the guest actually COLLECTS
+           data (result_size > 0) - a zero-collect get_result (chain
+           mid-hop) keeps the previous value, so output_data always
+           holds the hash of the LAST output that crossed the guest
+           boundary. --cfg veritas_no_channel_measure drops channel
+           hashing entirely (comparison variant). */
+        #[cfg(all(not(feature = "boottime"),
+                  not(veritas_no_channel_measure)))]
+        if !self.nested_call && self.result_size > 0 {
+            breakdown_outb(192);
+            self.process.measurements.output_data = self.process.context.channel.measure_output();
+            breakdown_outb(193);
         }
         breakdown_outb(221);
 
