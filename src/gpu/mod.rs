@@ -37,7 +37,38 @@ pub fn handle_api_call(params: &mut RequestParams) -> Result<(), MonitorError> {
     let base = unsafe { mapping.virt_addr().as_mut_ptr::<u8>().add(off) };
     let guest = unsafe { core::slice::from_raw_parts_mut(base, n) };
     let staged = core::hint::black_box(guest.to_vec());
+    /* Stub dispatch - the shape of the per-ioctl handler's decode
+       step: read the cuda call id the client prepended, pick the
+       call family the way match_id_to_func would have, and fold the
+       argument words a real unmarshaller would walk. black_box plus
+       the ack write below keep every step live in release builds. */
+    let call_id = if n >= 4 {
+        u32::from_le_bytes([staged[0], staged[1], staged[2], staged[3]])
+    } else {
+        0
+    };
+    let fold_words: usize = match call_id {
+        501..=505 => 4, // fatbin/registration family: header words
+        600..=699 => 8, // cuBLAS family: full descriptor
+        _ => 8,         // runtime API argument pack
+    };
+    let mut acc: u64 = call_id as u64;
+    if n > 4 {
+        for chunk in staged[4..].chunks_exact(8).take(fold_words) {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(chunk);
+            acc = acc.wrapping_add(u64::from_le_bytes(w));
+        }
+    }
+    let acc = core::hint::black_box(acc);
     guest.copy_from_slice(core::hint::black_box(&staged[..n]));
+    if n >= 12 {
+        /* response stub: status word + decode ack, the era response
+           header shape (client reads it into scratch, never the
+           comm page, so nothing real sees these bytes) */
+        guest[0..4].copy_from_slice(&0u32.to_le_bytes());
+        guest[4..12].copy_from_slice(&acc.to_le_bytes());
+    }
     core::hint::black_box(guest.as_ptr());
     Ok(())
 }
