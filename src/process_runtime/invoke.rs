@@ -49,7 +49,8 @@ enum TrustletInvocationType {
 
 pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), MonitorError> {
 
-    log::debug!("Invoking Trustlet");
+    /* per-invoke debug removed (2026-09-01): ~1 ms/serial line was
+       most of the ipc-chain hop floor */
 
     /* Bit 63 of rcx marks a vmpl.ko RE-ENTRY after a CONTINUE yield
        (see TrustletReturnType::CONTINUE): resume the parked VMPL1

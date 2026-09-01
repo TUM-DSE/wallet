@@ -261,7 +261,7 @@ impl AllocationRange {
             log::debug!("Trying to delete empty allocationRange");
             return;
         }
-        log::debug!("Deleting allocationRange {:#x?}", self);
+        /* per-invoke multi-line debug dump removed (2026-09-01) */
         let pgd_table_entry = ProcessPageTableEntry(PhysAddr::from(self.0));
         let (_mapping, pud_table) = paddr_as_table!(strip_paddr!(pgd_table_entry.0));
         for i in 0..512 {
