@@ -33,6 +33,12 @@ use crate::{MonitorError, RequestParams};
 /// Guest request flag (rdx): allocate the rest synchronously on the
 /// calling vCPU - the no-worker fallback, the legacy cost paid once.
 pub const REQUEST_EAGER: u64 = 1 << 0;
+/// Old-load measurement mode (STRICTLY opt-in, guest sets it only
+/// under VERITAS_OLD_LOAD=1): forbid worker claiming for this load's
+/// epoch so allocation is synchronous on the calling vCPU and the
+/// hash falls back to the legacy whole-model pass at fin - the
+/// pre-streaming design, re-attached for comparison.
+pub const REQUEST_SYNC: u64 = 1 << 1;
 
 /// Reply state bits, packed into rcx bits 56.. (the watermark lives
 /// in bits 0..56; a single-register reply because the guest kernel's
@@ -63,6 +69,9 @@ const WORKER_NONE: i64 = -1;
 const WORKER_EAGER: i64 = 1000;
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Epoch for which claim() is forbidden (REQUEST_SYNC); stale epochs
+/// are naturally inert. u64::MAX = never.
+static NO_CLAIM_EPOCH: AtomicU64 = AtomicU64::new(u64::MAX);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 static RANGE0: AtomicU64 = AtomicU64::new(0);
 static RANGE_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -508,6 +517,9 @@ pub fn update(params: &mut RequestParams) -> Result<(), MonitorError> {
     let announced = core::cmp::min(params.rcx, total);
     WRITTEN.fetch_max(announced, Ordering::SeqCst);
 
+    if params.rdx & REQUEST_SYNC != 0 {
+        NO_CLAIM_EPOCH.store(EPOCH.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
     if params.rdx & REQUEST_EAGER != 0 {
         /* Claim the allocator role so a late worker cannot interleave
            growth. If a worker already holds it, just report - it is
@@ -596,6 +608,9 @@ fn claim(core: usize) {
     use crate::crypto::sha512_create;
 
     let epoch = EPOCH.load(Ordering::SeqCst);
+    if NO_CLAIM_EPOCH.load(Ordering::SeqCst) == epoch {
+        return;
+    }
     if WORKER.compare_exchange(WORKER_NONE, core as i64,
                                Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
