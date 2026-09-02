@@ -73,6 +73,21 @@ impl PALContext {
         self.vmsa.rip = q[3];
         self.vmsa.rflags = q[5];
         self.vmsa.rsp = q[6];
+        /* The exception entry left the VMSA at ring 0 (CS = SVSM_CS,
+           SS = NULL, CPL 0 - the interrupt gate's doing). Without
+           restoring them the trustlet resumes its USER code at CPL 0;
+           the NEXT phantom event then pushes its frame on the user
+           stack (no TSS.RSP0 switch at same-CPL), fails the selector
+           guard above and kills the trustlet - the comm-lane >=256KiB
+           "reserved-bit #PF" (2026-09-02, one longer-running invoke =
+           more exposure). Same descriptors setup_exceptions builds. */
+        self.vmsa.cs = cpuarch::vmsa::VMSASegment {
+            selector: 0x1b, flags: 0xAFB, base: 0, limit: 0xFFFF_FFFF,
+        };
+        self.vmsa.ss = cpuarch::vmsa::VMSASegment {
+            selector: 0x23, flags: 0xCF3, base: 0, limit: 0xFFFF_FFFF,
+        };
+        self.vmsa.cpl = 3;
         true
     }
 }
@@ -284,19 +299,29 @@ impl ProcessRuntimeException for PALContext {
                  */
 
                 log::info!("[Trustlet] #PF: RIP={:#x}, CR2={:#x}, Error code={:?}", rip, cr2, error_code);
-                if error_code & PF_PRESENT == 0 {
+                if error_code > 0xFFFF {
+                    /* A hardware #PF error code fits 16 bits. A bigger
+                       value means the entry's error-code load read a
+                       frame word instead (no-error-code event) -
+                       decoding it as PF bits mislabels the crash (the
+                       bogus "reserved/instruction fetch" of the
+                       comm-lane 256KiB diagnosis). */
+                    log::info!("[Trustlet] error-code register exceeds 16 bits - \
+                                no-error-code event frame, PF bits not decoded");
+                }
+                if error_code <= 0xFFFF && error_code & PF_PRESENT == 0 {
                     log::info!("[Trustlet] Page fault: not present");
                 }
-                if error_code & PF_WRITE != 0 {
+                if error_code <= 0xFFFF && error_code & PF_WRITE != 0 {
                     log::info!("[Trustlet] Page fault: write");
                 }
-                if error_code & PF_USER != 0 {
+                if error_code <= 0xFFFF && error_code & PF_USER != 0 {
                     log::info!("[Trustlet] Page fault: user");
                 }
-                if error_code & PF_RESERVED != 0 {
+                if error_code <= 0xFFFF && error_code & PF_RESERVED != 0 {
                     log::info!("[Trustlet] Page fault: reserved");
                 }
-                if error_code & PF_INSTRUCTION != 0 {
+                if error_code <= 0xFFFF && error_code & PF_INSTRUCTION != 0 {
                     log::info!("[Trustlet] Page fault: instruction fetch");
                 }
                 /* Phase-0 instrumentation: which monitor-managed PML4
