@@ -590,6 +590,14 @@ pub fn poll_worker(core: usize) {
             release_core(core);
             return;
         }
+        /* REQUEST_SYNC eviction (old-load measurement): the guest
+           asked for the synchronous path after we claimed - drop the
+           claim so its eager announce can take the allocator role. */
+        if NO_CLAIM_EPOCH.load(Ordering::SeqCst) == EPOCH.load(Ordering::SeqCst) {
+            log::info!("model stream: worker evicted (REQUEST_SYNC)");
+            release_core(core);
+            return;
+        }
         coordinator_quantum(core);
         return;
     }
